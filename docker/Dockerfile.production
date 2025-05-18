@@ -1,41 +1,43 @@
-# Stage 1: Build the frontend
-FROM node:18-alpine AS frontend-builder
-
-WORKDIR /app/frontend
-
-# Copy frontend files
-COPY frontend/ ./
-
-# Install dependencies
-RUN npm ci
-
-# Build the frontend
-RUN npm run build
-
-# Stage 2: Build the Python backend
+# Δημιουργία του αρχείου docker/Dockerfile.production
 FROM python:3.10-slim
 
-# Set working directory
+# Εγκατάσταση βασικών εργαλείων και Node.js
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg \
+    git \
+    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Έλεγχος εγκατάστασης
+RUN node --version && npm --version && python --version
+
+# Ρύθμιση του περιβάλλοντος εργασίας
 WORKDIR /app
 
-# Install dependencies
+# Εγκατάσταση Python dependencies με caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy Python backend code
+# Αντιγραφή και build του frontend
+COPY frontend/ ./frontend/
+WORKDIR /app/frontend
+RUN npm ci && npm run build
+
+# Επιστροφή στον βασικό κατάλογο
+WORKDIR /app
+
+# Αντιγραφή του κώδικα backend
 COPY raft/ ./raft/
 COPY api/ ./api/
 COPY cli/ ./cli/
 COPY tests/ ./tests/
 COPY pyproject.toml ./
 
-# Copy the built frontend from the frontend-builder stage
-COPY --from=frontend-builder /app/frontend/out ./frontend/out
-
 # Expose ports
-# 7000-7002: Raft node RPC
-# 8000-8002: API server
 EXPOSE 7000-7002 8000-8002
 
-# Set entrypoint to Python
+# Ορισμός entrypoint
 ENTRYPOINT ["python"]

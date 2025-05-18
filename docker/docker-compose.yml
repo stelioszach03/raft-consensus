@@ -1,48 +1,71 @@
-version: '3'
-
+# Δημιουργία του αρχείου docker/docker-compose.yml
 services:
   node0:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
-    command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8000"]
+    container_name: raft-node0
+    command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8000", "--debug"]
     ports:
-      - "7100:7000"  # Εξωτερική θύρα 7100, εσωτερική 7000
-      - "8100:8000"  # Εξωτερική θύρα 8100, εσωτερική 8000
+      - "7100:7000"
+      - "8100:8000"
     volumes:
       - raft_data:/app/data
     networks:
       - raft_network
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
 
   node1:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
-    command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8001"]
+    container_name: raft-node1
+    command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8001", "--debug"]
     ports:
-      - "7101:7001"  # Εξωτερική θύρα 7101, εσωτερική 7001
-      - "8101:8001"  # Εξωτερική θύρα 8101, εσωτερική 8001
+      - "7101:7001"
+      - "8101:8001"
     volumes:
       - raft_data:/app/data
     networks:
       - raft_network
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      node0:
+        condition: service_started
 
   node2:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
-    command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8002"]
+    container_name: raft-node2
+    command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8002", "--debug"]
     ports:
-      - "7102:7002"  # Εξωτερική θύρα 7102, εσωτερική 7002
-      - "8102:8002"  # Εξωτερική θύρα 8102, εσωτερική 8002
+      - "7102:7002"
+      - "8102:8002"
     volumes:
       - raft_data:/app/data
     networks:
       - raft_network
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      node1:
+        condition: service_started
 
 networks:
   raft_network:
     driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
 
 volumes:
   raft_data:
+    driver: local

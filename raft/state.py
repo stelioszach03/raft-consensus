@@ -66,8 +66,8 @@ class VolatileState:
         self.leader_id: Optional[str] = None
         self.last_heartbeat_time = 0.0
         
-        # Προσθέστε διαφορετική καθυστέρηση για κάθε κόμβο για να αποφύγετε ταυτόχρονες εκλογές
-        time.sleep(random.uniform(0.1, 0.3))
+        # Προσθήκα πιο διαφοροποιημένης καθυστέρησης για κάθε κόμβο
+        time.sleep(random.uniform(0.1, 1.0))  # Αυξημένο από (0.1, 0.3) σε (0.1, 1.0)
     
     def update_heartbeat(self) -> None:
         """Update the last time a heartbeat was received."""

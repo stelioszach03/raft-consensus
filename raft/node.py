@@ -60,7 +60,13 @@ class RaftNode:
         
         # Μηχανισμός για αποφυγή διαδοχικών εκλογών από τον ίδιο κόμβο
         self.consecutive_elections = 0
-        self.max_consecutive_elections = 2
+        self.max_consecutive_elections = 5  # Αυξημένο από 2
+        
+        # Χρόνος τελευταίας επιτυχούς εκλογής
+        self.last_successful_election_time = 0.0
+        
+        # Σταθερότητα εκλογών
+        self.election_stability_factor = 1.0
     
     async def start(self) -> None:
         """Start the Raft node."""
@@ -122,7 +128,7 @@ class RaftNode:
             
             # Προστασία από πολύ συχνές εκλογές
             current_time = asyncio.get_event_loop().time()
-            if current_time - self.last_election_time < 1.0:  # Τουλάχιστον 1 δευτερόλεπτο μεταξύ εκλογών
+            if current_time - self.last_election_time < 1.5:  # Αυξημένο από 1.0 σε 1.5 δευτερόλεπτα
                 logger.debug(f"Node {self.node_id} skipping election, too soon after last one")
                 self.reset_election_timer()
                 return
@@ -134,6 +140,8 @@ class RaftNode:
                 
             if self.consecutive_elections >= self.max_consecutive_elections:
                 logger.debug(f"Node {self.node_id} has initiated too many consecutive elections, backing off")
+                # Αυξημένη καθυστέρηση όταν φτάνουμε το όριο διαδοχικών εκλογών
+                await asyncio.sleep(random.uniform(2.0, 5.0))
                 self.consecutive_elections = 0
                 self.reset_election_timer()
                 return
@@ -153,6 +161,9 @@ class RaftNode:
         self.consecutive_elections += 1
         
         try:
+            # Υπολογισμός του stability factor - αυξάνεται με κάθε διαδοχική εκλογή
+            self.election_stability_factor = min(1.0 + (self.consecutive_elections * 0.2), 3.0)
+            
             # Increment current term
             self.persistent_state.current_term += 1
             new_term = self.persistent_state.current_term
@@ -207,11 +218,17 @@ class RaftNode:
                 # If we have enough votes, become leader
                 if votes_received >= votes_needed:
                     logger.info(f"Node {self.node_id} won election with {votes_received} votes")
+                    # Καταγραφή επιτυχούς εκλογής
+                    self.last_successful_election_time = asyncio.get_event_loop().time()
+                    self.consecutive_elections = 0  # Επαναφορά μετρητή
                     self.become_leader()
                     return
             
             # If we get here, we didn't win the election
             logger.info(f"Node {self.node_id} lost election, returning to follower state")
+            # Προσθήκη τυχαίας καθυστέρησης μετά από αποτυχημένη εκλογή
+            # Η καθυστέρηση αυξάνεται με βάση το stability factor
+            await asyncio.sleep(random.uniform(1.0, 3.0) * self.election_stability_factor)
             self.become_follower(self.persistent_state.current_term)
         finally:
             # Σημειώνουμε ότι η εκλογή ολοκληρώθηκε
@@ -683,10 +700,20 @@ class RaftNode:
         self.leader_state = None
         
         # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε follower
-        self.consecutive_elections = 0
+        # μόνο αν έχει περάσει αρκετός χρόνος
+        current_time = asyncio.get_event_loop().time()
+        if current_time - self.last_election_time > 5.0:
+            self.consecutive_elections = 0
         
-        # Reset election timer
-        self.reset_election_timer()
+        # Reset election timer με μεγαλύτερο timeout όταν γίνεται follower
+        # για να δώσει χρόνο στο σύστημα να σταθεροποιηθεί
+        if self.election_timer:
+            self.election_timer.cancel()
+
+        timeout = self.config.random_election_timeout * self.election_stability_factor
+        logger.debug(f"Node {self.node_id} setting election timeout as follower: {timeout:.2f}s")
+        
+        self.election_timer = asyncio.create_task(self.election_timeout(timeout))
         
         # Update cluster state for UI
         self.update_cluster_state()
