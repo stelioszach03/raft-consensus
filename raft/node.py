@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import random
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 from raft.config import RaftConfig
 from raft.log import RaftLog, LogEntry
@@ -53,6 +53,14 @@ class RaftNode:
         # Cluster state information for UI
         self.cluster_state = ClusterState(self.node_id, config)
         self.update_cluster_state()
+        
+        # Για την προστασία από ταυτόχρονες εκλογές
+        self.election_in_progress = False
+        self.last_election_time = 0.0
+        
+        # Μηχανισμός για αποφυγή διαδοχικών εκλογών από τον ίδιο κόμβο
+        self.consecutive_elections = 0
+        self.max_consecutive_elections = 2
     
     async def start(self) -> None:
         """Start the Raft node."""
@@ -96,7 +104,12 @@ class RaftNode:
         if self.election_timer:
             self.election_timer.cancel()
         
+        # Χρήση του σταθερού τυχαίου timeout που εξαρτάται από το node_id
         timeout = self.config.random_election_timeout
+        
+        # Καταγραφή για διαγνωστικούς σκοπούς
+        logger.debug(f"Node {self.node_id} setting election timeout: {timeout:.2f}s")
+        
         self.election_timer = asyncio.create_task(self.election_timeout(timeout))
     
     async def election_timeout(self, timeout: float) -> None:
@@ -106,6 +119,25 @@ class RaftNode:
         """
         try:
             await asyncio.sleep(timeout)
+            
+            # Προστασία από πολύ συχνές εκλογές
+            current_time = asyncio.get_event_loop().time()
+            if current_time - self.last_election_time < 1.0:  # Τουλάχιστον 1 δευτερόλεπτο μεταξύ εκλογών
+                logger.debug(f"Node {self.node_id} skipping election, too soon after last one")
+                self.reset_election_timer()
+                return
+            
+            if self.election_in_progress:
+                logger.debug(f"Node {self.node_id} skipping election, another one in progress")
+                self.reset_election_timer()
+                return
+                
+            if self.consecutive_elections >= self.max_consecutive_elections:
+                logger.debug(f"Node {self.node_id} has initiated too many consecutive elections, backing off")
+                self.consecutive_elections = 0
+                self.reset_election_timer()
+                return
+                
             if self.volatile_state.state != NodeState.LEADER:
                 logger.info(f"Node {self.node_id} election timeout - starting election")
                 await self.start_election()
@@ -115,67 +147,89 @@ class RaftNode:
     
     async def start_election(self) -> None:
         """Start a leader election."""
-        # Increment current term
-        self.persistent_state.current_term += 1
-        new_term = self.persistent_state.current_term
+        # Σημειώνουμε ότι μια εκλογή είναι σε εξέλιξη
+        self.election_in_progress = True
+        self.last_election_time = asyncio.get_event_loop().time()
+        self.consecutive_elections += 1
         
-        # Change to candidate state
-        self.become_candidate()
-        
-        # Vote for self
-        self.persistent_state.record_vote(self.node_id)
-        
-        # Get last log info
-        last_log_term, last_log_index = self.log.get_last_log_term_and_index()
-        
-        # Track votes
-        votes_received = 1  # Vote for self
-        votes_needed = (len(self.peers) + 1) // 2 + 1
-        
-        # Request votes from all peers
-        vote_tasks = []
-        for peer in self.peers:
-            peer_address = peer
-            task = asyncio.create_task(
-                self.rpc.request_vote(
-                    peer_address,
-                    new_term,
-                    self.node_id,
-                    last_log_index,
-                    last_log_term
+        try:
+            # Increment current term
+            self.persistent_state.current_term += 1
+            new_term = self.persistent_state.current_term
+            
+            # Change to candidate state
+            self.become_candidate()
+            
+            # Vote for self
+            self.persistent_state.record_vote(self.node_id)
+            
+            # Get last log info
+            last_log_term, last_log_index = self.log.get_last_log_term_and_index()
+            
+            # Track votes
+            votes_received = 1  # Vote for self
+            votes_needed = (len(self.peers) + 1) // 2 + 1
+            
+            # Request votes from all peers
+            vote_tasks = []
+            for peer in self.peers:
+                peer_address = peer
+                task = asyncio.create_task(
+                    self.rpc.request_vote(
+                        peer_address,
+                        new_term,
+                        self.node_id,
+                        last_log_index,
+                        last_log_term
+                    )
                 )
-            )
-            vote_tasks.append(task)
-        
-        # Wait for votes
-        for task in asyncio.as_completed(vote_tasks):
-            response = await task
-            if response.get("vote_granted", False):
-                votes_received += 1
-                logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
+                vote_tasks.append(task)
             
-            # If we got a higher term, revert to follower
-            if response.get("term", 0) > self.persistent_state.current_term:
-                self.become_follower(response["term"])
-                return
+            # Wait for votes - use gather with return_exceptions=True για να αποφύγουμε τα σφάλματα
+            responses = await asyncio.gather(*vote_tasks, return_exceptions=True)
             
-            # If we have enough votes, become leader
-            if votes_received >= votes_needed:
-                logger.info(f"Node {self.node_id} won election with {votes_received} votes")
-                self.become_leader()
-                return
-        
-        # If we get here, we didn't win the election
-        self.become_follower(self.persistent_state.current_term)
+            # Process responses
+            for response in responses:
+                if isinstance(response, Exception):
+                    logger.warning(f"Error during vote request: {response}")
+                    continue
+                    
+                if response.get("vote_granted", False):
+                    votes_received += 1
+                    logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
+                
+                # If we got a higher term, revert to follower
+                if response.get("term", 0) > self.persistent_state.current_term:
+                    logger.info(f"Node {self.node_id} discovered higher term during election")
+                    self.become_follower(response["term"])
+                    return
+                
+                # If we have enough votes, become leader
+                if votes_received >= votes_needed:
+                    logger.info(f"Node {self.node_id} won election with {votes_received} votes")
+                    self.become_leader()
+                    return
+            
+            # If we get here, we didn't win the election
+            logger.info(f"Node {self.node_id} lost election, returning to follower state")
+            self.become_follower(self.persistent_state.current_term)
+        finally:
+            # Σημειώνουμε ότι η εκλογή ολοκληρώθηκε
+            self.election_in_progress = False
     
     async def send_heartbeats(self) -> None:
         """Send heartbeats (empty AppendEntries) to all peers."""
+        heartbeat_delay = 0.01  # Short delay between heartbeats
+        
         while (
             not self.shutdown_event.is_set() and 
             self.volatile_state.state == NodeState.LEADER
         ):
             try:
-                # Send heartbeats to all peers
+                # Log for debugging
+                logger.debug(f"Leader {self.node_id} sending heartbeats to {len(self.peers)} peers")
+                
+                # Send heartbeats to all peers - χρήση gather για παράλληλη αποστολή
                 heartbeat_tasks = []
                 for peer in self.peers:
                     peer_address = peer
@@ -200,14 +254,25 @@ class RaftNode:
                     )
                     heartbeat_tasks.append(task)
                 
-                # Wait for responses
-                for task in asyncio.as_completed(heartbeat_tasks):
-                    response = await task
+                # Wait for responses - use gather με return_exceptions για αποφυγή σφαλμάτων
+                responses = await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
+                
+                # Process responses
+                for i, response in enumerate(responses):
+                    if isinstance(response, Exception):
+                        logger.warning(f"Error sending heartbeat: {response}")
+                        continue
                     
                     # If we got a higher term, revert to follower
                     if response.get("term", 0) > self.persistent_state.current_term:
+                        logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
                         self.become_follower(response["term"])
                         return
+                    
+                    # If successful, check for pending entries to replicate
+                    peer = self.peers[i]
+                    if response.get("success", False) and self.needs_replication(peer):
+                        asyncio.create_task(self.replicate_log(peer))
                 
                 # Update cluster state for UI
                 self.update_cluster_state()
@@ -220,8 +285,19 @@ class RaftNode:
                 logger.error(f"Error sending heartbeats: {e}")
                 await asyncio.sleep(0.1)
     
+    def needs_replication(self, peer: str) -> bool:
+        """Check if a peer needs log replication."""
+        if not self.leader_state:
+            return False
+            
+        return self.log.last_index >= self.leader_state.next_index[peer]
+    
     async def replicate_log(self, peer: str) -> None:
         """Replicate log entries to a specific peer."""
+        if not self.leader_state:
+            logger.warning(f"Cannot replicate logs - no leader state")
+            return
+            
         peer_address = peer
         next_index = self.leader_state.next_index[peer]
         
@@ -243,57 +319,66 @@ class RaftNode:
         # Convert entries to dicts for transmission
         entries_dict = [entry.to_dict() for entry in entries_to_send]
         
-        # Send append entries RPC
-        response = await self.rpc.append_entries(
-            peer_address,
-            self.persistent_state.current_term,
-            self.node_id,
-            prev_log_index,
-            prev_log_term,
-            entries_dict,
-            self.volatile_state.commit_index
-        )
-        
-        # Handle response
-        if response.get("term", 0) > self.persistent_state.current_term:
-            self.become_follower(response["term"])
-            return
-        
-        if response.get("success", False):
-            # Update follower's progress
-            match_index = prev_log_index + len(entries_to_send)
-            self.leader_state.update_follower_progress(peer, match_index)
+        try:
+            # Send append entries RPC
+            response = await self.rpc.append_entries(
+                peer_address,
+                self.persistent_state.current_term,
+                self.node_id,
+                prev_log_index,
+                prev_log_term,
+                entries_dict,
+                self.volatile_state.commit_index
+            )
             
-            # Try to advance commit index
-            self.update_commit_index()
-        else:
-            # If failed, decrement nextIndex and try again
-            if self.leader_state.next_index[peer] > 1:
-                self.leader_state.next_index[peer] -= 1
-                # Try again immediately
-                await self.replicate_log(peer)
+            # Handle response
+            if response.get("term", 0) > self.persistent_state.current_term:
+                logger.info(f"Node {self.node_id} discovered higher term during replication")
+                self.become_follower(response["term"])
+                return
+            
+            if response.get("success", False):
+                # Update follower's progress
+                match_index = prev_log_index + len(entries_to_send)
+                if self.leader_state:  # Double-check leader state still exists
+                    self.leader_state.update_follower_progress(peer, match_index)
+                
+                # Try to advance commit index
+                self.update_commit_index()
+                logger.debug(f"Successfully replicated {len(entries_to_send)} entries to {peer}")
+            else:
+                # If failed, decrement nextIndex and try again
+                if self.leader_state and self.leader_state.next_index[peer] > 1:
+                    self.leader_state.next_index[peer] -= 1
+                    # Try again immediately
+                    await self.replicate_log(peer)
+        except Exception as e:
+            logger.error(f"Error replicating log to {peer}: {e}")
     
     def update_commit_index(self) -> None:
         """
         Update commit index if there exists a majority-replicated index in current term.
         Called when a follower successfully replicates entries.
         """
-        if self.volatile_state.state != NodeState.LEADER:
+        if self.volatile_state.state != NodeState.LEADER or not self.leader_state:
             return
         
-        # Get the sorted match indices for all peers
-        match_indices = sorted(self.leader_state.match_index.values())
+        # Get our current match indices plus our own last log index
+        match_indices = list(self.leader_state.match_index.values())
+        match_indices.append(self.log.last_index)  # Include leader's own log
         
-        # Find the median (majority-replicated) index
+        # Sort to find the median (majority-replicated) index
+        match_indices.sort()
         majority_index = len(match_indices) // 2
         new_commit_index = match_indices[majority_index]
         
-        # Only advance commit index for entries from current term
-        if (new_commit_index > self.volatile_state.commit_index and
-            self.log.get_entry(new_commit_index) and
-            self.log.get_entry(new_commit_index).term == self.persistent_state.current_term):
-            logger.info(f"Advancing commit index to {new_commit_index}")
-            self.volatile_state.commit_index = new_commit_index
+        # Only advance commit index for entries from current term or earlier terms
+        # that haven't been committed yet
+        if new_commit_index > self.volatile_state.commit_index:
+            entry = self.log.get_entry(new_commit_index)
+            if entry:
+                logger.info(f"Advancing commit index to {new_commit_index}")
+                self.volatile_state.commit_index = new_commit_index
     
     async def apply_committed_entries(self) -> None:
         """Apply committed log entries to the state machine."""
@@ -304,7 +389,7 @@ class RaftNode:
             if entry:
                 # Apply command to state machine
                 await self.apply_command(entry.command)
-                logger.info(f"Applied entry {self.volatile_state.last_applied} to state machine")
+                logger.info(f"Applied entry {self.volatile_state.last_applied} to state machine: {entry.command}")
     
     async def apply_command(self, command: Dict[str, Any]) -> Any:
         """Apply a command to the state machine."""
@@ -330,6 +415,10 @@ class RaftNode:
                 return True
             return False
         
+        # No-op command for leader election
+        elif operation == "no-op":
+            return None
+            
         return None
     
     async def handle_vote_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -342,8 +431,11 @@ class RaftNode:
         last_log_index = request.get("last_log_index", 0)
         last_log_term = request.get("last_log_term", 0)
         
+        logger.debug(f"Node {self.node_id} received vote request from {candidate_id} for term {term}")
+        
         # If the term is outdated, reject vote
         if term < self.persistent_state.current_term:
+            logger.debug(f"Rejecting vote: term {term} < our term {self.persistent_state.current_term}")
             return {
                 "term": self.persistent_state.current_term,
                 "vote_granted": False
@@ -351,6 +443,7 @@ class RaftNode:
         
         # If the term is newer, update our term and become follower
         if term > self.persistent_state.current_term:
+            logger.debug(f"Updating term: {self.persistent_state.current_term} -> {term}")
             self.become_follower(term)
         
         # Check if we can vote for this candidate
@@ -365,14 +458,24 @@ class RaftNode:
             # Check if candidate's log is at least as up-to-date as ours
             our_last_term, our_last_index = self.log.get_last_log_term_and_index()
             
-            if (last_log_term > our_last_term or
-                (last_log_term == our_last_term and last_log_index >= our_last_index)):
+            log_is_current = False
+            if last_log_term > our_last_term:
+                log_is_current = True
+            elif last_log_term == our_last_term and last_log_index >= our_last_index:
+                log_is_current = True
+                
+            if log_is_current:
                 # Grant vote
                 vote_granted = True
                 self.persistent_state.record_vote(candidate_id)
+                logger.debug(f"Granting vote to {candidate_id} for term {term}")
                 
                 # Reset election timer since we're granting a vote
                 self.reset_election_timer()
+            else:
+                logger.debug(f"Rejecting vote: candidate log not current: ({last_log_term},{last_log_index}) vs ours ({our_last_term},{our_last_index})")
+        else:
+            logger.debug(f"Rejecting vote: already voted for {self.persistent_state.voted_for} in term {self.persistent_state.current_term}")
         
         return {
             "term": self.persistent_state.current_term,
@@ -391,8 +494,16 @@ class RaftNode:
         entries = request.get("entries", [])
         leader_commit = request.get("leader_commit", 0)
         
+        # Log for debugging
+        is_heartbeat = not entries
+        if is_heartbeat:
+            logger.debug(f"Node {self.node_id} received heartbeat from {leader_id} (term {term})")
+        else:
+            logger.debug(f"Node {self.node_id} received {len(entries)} entries from {leader_id} (term {term})")
+        
         # If the term is outdated, reject
         if term < self.persistent_state.current_term:
+            logger.debug(f"Rejecting AppendEntries: term {term} < our term {self.persistent_state.current_term}")
             return {
                 "term": self.persistent_state.current_term,
                 "success": False
@@ -404,6 +515,7 @@ class RaftNode:
         
         # If the term is newer, update our term
         if term > self.persistent_state.current_term:
+            logger.debug(f"Updating term from AppendEntries: {self.persistent_state.current_term} -> {term}")
             self.become_follower(term)
         else:
             # Reset election timer
@@ -411,10 +523,12 @@ class RaftNode:
             
             # Make sure we're a follower
             if self.volatile_state.state != NodeState.FOLLOWER:
+                logger.info(f"Node {self.node_id} changing from {self.volatile_state.state} to follower due to AppendEntries")
                 self.become_follower(term)
         
         # Check log consistency
         if not self.log.check_consistency(prev_log_index, prev_log_term):
+            logger.debug(f"Log inconsistency: prev_log_index={prev_log_index}, prev_log_term={prev_log_term}")
             return {
                 "term": self.persistent_state.current_term,
                 "success": False
@@ -433,12 +547,15 @@ class RaftNode:
         # Append entries to log
         if log_entries:
             self.log.append_entries(prev_log_index, log_entries)
+            logger.debug(f"Appended {len(log_entries)} entries to log, now has {len(self.log.entries)} entries")
         
         # Update commit index
         if leader_commit > self.volatile_state.commit_index:
+            old_commit_index = self.volatile_state.commit_index
             self.volatile_state.commit_index = min(
                 leader_commit, self.log.last_index
             )
+            logger.debug(f"Updated commit index: {old_commit_index} -> {self.volatile_state.commit_index}")
         
         # Update cluster state for UI
         self.update_cluster_state()
@@ -454,54 +571,97 @@ class RaftNode:
         If leader, append to log and replicate.
         If follower, redirect to leader.
         """
-        if self.volatile_state.state != NodeState.LEADER:
-            # Redirect to leader if known
-            if self.volatile_state.leader_id:
+        # Προσθήκη retry λογικής
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            if self.volatile_state.state != NodeState.LEADER:
+                # Redirect to leader if known
+                if self.volatile_state.leader_id:
+                    logger.info(f"Redirecting client request to leader {self.volatile_state.leader_id}")
+                    # Εδώ θα μπορούσαμε να έχουμε κώδικα προώθησης, αλλά για απλότητα
+                    # απλά επιστρέφουμε την πληροφορία του ηγέτη
+                    return {
+                        "success": False,
+                        "leader": self.volatile_state.leader_id,
+                        "message": "Please retry with the leader node"
+                    }
+                else:
+                    # Αν δεν υπάρχει γνωστός ηγέτης, περιμένουμε λίγο και ξαναπροσπαθούμε
+                    if attempt < max_retries - 1:
+                        logger.debug(f"No known leader, retrying ({attempt+1}/{max_retries})")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return {
+                        "success": False,
+                        "error": "No leader known - please try again later",
+                        "retry": True
+                    }
+            
+            # Αν φτάσαμε εδώ, είμαστε ο ηγέτης
+            logger.info(f"Leader {self.node_id} handling client request: {command}")
+            
+            try:
+                # Append to log
+                entry = self.log.append(self.persistent_state.current_term, command)
+                
+                # Replicate to followers
+                replication_tasks = []
+                for peer in self.peers:
+                    task = asyncio.create_task(self.replicate_log(peer))
+                    replication_tasks.append(task)
+                
+                # Wait for replication with timeout
+                await asyncio.wait(replication_tasks, timeout=2.0)
+                
+                # Wait for command to be applied
+                max_wait = 5.0  # seconds
+                wait_start = asyncio.get_event_loop().time()
+                
+                while (
+                    self.volatile_state.last_applied < entry.index and
+                    asyncio.get_event_loop().time() - wait_start < max_wait
+                ):
+                    await asyncio.sleep(0.05)
+                
+                # Check if the command was applied
+                if self.volatile_state.last_applied >= entry.index:
+                    # Get result from state machine
+                    result = await self.apply_command(command)
+                    logger.info(f"Client request successful, applied to state machine: {command}")
+                    return {
+                        "success": True,
+                        "index": entry.index,
+                        "result": result
+                    }
+                else:
+                    logger.warning(f"Timeout waiting for replication of {command}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return {
+                        "success": False,
+                        "error": "Timeout waiting for replication",
+                        "retry": True
+                    }
+            except Exception as e:
+                logger.error(f"Error handling client request: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    continue
                 return {
                     "success": False,
-                    "leader": self.volatile_state.leader_id
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "No leader known"
+                    "error": f"Error: {str(e)}",
+                    "retry": True
                 }
         
-        # Append to log
-        entry = self.log.append(self.persistent_state.current_term, command)
-        
-        # Replicate to followers
-        replication_tasks = []
-        for peer in self.peers:
-            task = asyncio.create_task(self.replicate_log(peer))
-            replication_tasks.append(task)
-        
-        await asyncio.gather(*replication_tasks)
-        
-        # Wait for command to be applied
-        max_wait = 5.0  # seconds
-        wait_start = asyncio.get_event_loop().time()
-        
-        while (
-            self.volatile_state.last_applied < entry.index and
-            asyncio.get_event_loop().time() - wait_start < max_wait
-        ):
-            await asyncio.sleep(0.05)
-        
-        # Check if the command was applied
-        if self.volatile_state.last_applied >= entry.index:
-            # Get result from state machine
-            result = await self.apply_command(command)
-            return {
-                "success": True,
-                "index": entry.index,
-                "result": result
-            }
-        else:
-            return {
-                "success": False,
-                "error": "Timeout waiting for replication"
-            }
+        # Αν φτάσαμε εδώ, έχουν αποτύχει όλες οι προσπάθειες
+        return {
+            "success": False,
+            "error": "All retries failed",
+            "retry": True
+        }
     
     def become_follower(self, term: int) -> None:
         """Transition to follower state."""
@@ -521,6 +681,9 @@ class RaftNode:
         
         # Reset leader state
         self.leader_state = None
+        
+        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε follower
+        self.consecutive_elections = 0
         
         # Reset election timer
         self.reset_election_timer()
@@ -561,6 +724,12 @@ class RaftNode:
         if self.election_timer:
             self.election_timer.cancel()
             self.election_timer = None
+        
+        # Append a no-op entry to commit any previous entries
+        self.log.append(self.persistent_state.current_term, {"operation": "no-op"})
+        
+        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε leader
+        self.consecutive_elections = 0
         
         # Start sending heartbeats
         self.heartbeat_timer = asyncio.create_task(self.send_heartbeats())

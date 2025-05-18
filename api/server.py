@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Dict, Any, List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -46,11 +46,18 @@ class WebSocketManager:
             return
             
         logger.debug(f"Broadcasting to {len(self.active_connections)} clients")
+        disconnected = set()
+        
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
+                disconnected.add(connection)
+        
+        # Remove disconnected clients
+        for connection in disconnected:
+            self.active_connections.remove(connection)
 
 
 class RaftAPI:
@@ -61,6 +68,10 @@ class RaftAPI:
         self.port = port
         self.app = FastAPI(title="Raft Consensus API")
         self.websocket_manager = WebSocketManager()
+        
+        # Προστασία από ταυτόχρονες προσομοιώσεις
+        self.simulation_lock = asyncio.Lock()
+        self.simulation_in_progress = False
         
         # Set up CORS
         self.app.add_middleware(
@@ -116,44 +127,87 @@ class RaftAPI:
             
             return result
         
-        # Νέα endpoints για προσομοιώσεις
         @self.app.post("/simulation/node-failure")
         async def simulate_node_failure() -> Dict[str, Any]:
             """Simulate a node failure."""
-            logger.info(f"Simulating node failure for node {self.node.node_id}")
-            # Αποσύνδεση προσωρινά από το δίκτυο
-            self.node.rpc.disable_network = True
-            # Επανασύνδεση μετά από καθυστέρηση
-            task = asyncio.create_task(self._reconnect_after_delay(5))
-            self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
-            return {"success": True, "message": "Node network disabled temporarily"}
+            # Έλεγχος αν υπάρχει ήδη προσομοίωση σε εξέλιξη
+            if self.simulation_in_progress:
+                return {
+                    "success": False,
+                    "message": "Another simulation is already in progress"
+                }
+                
+            async with self.simulation_lock:
+                self.simulation_in_progress = True
+                try:
+                    logger.info(f"Simulating node failure for node {self.node.node_id}")
+                    # Αποσύνδεση προσωρινά από το δίκτυο
+                    self.node.rpc.disable_network = True
+                    # Επανασύνδεση μετά από καθυστέρηση
+                    task = asyncio.create_task(self._reconnect_after_delay(5))
+                    self.background_tasks.add(task)
+                    task.add_done_callback(self.background_tasks.discard)
+                    return {"success": True, "message": "Node network disabled temporarily"}
+                finally:
+                    # Απελευθέρωση του lock μετά από καθυστέρηση
+                    asyncio.create_task(self._release_simulation_lock(5))
         
         @self.app.post("/simulation/network-partition")
         async def simulate_network_partition() -> Dict[str, Any]:
             """Simulate a network partition."""
-            if not self.node.peers:
-                return {"success": False, "message": "No peers available for partition"}
-            
-            # Αποσύνδεση από τους μισούς peers
-            peers_to_disconnect = self.node.peers[:len(self.node.peers)//2]
-            logger.info(f"Simulating network partition: disconnecting from {peers_to_disconnect}")
-            self.node.rpc.disconnect_peers(peers_to_disconnect)
-            
-            # Επανασύνδεση μετά από καθυστέρηση
-            task = asyncio.create_task(self._reconnect_all_peers_after_delay(10))
-            self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
-            
-            return {"success": True, "message": f"Network partition simulated, disconnected from {peers_to_disconnect}"}
+            # Έλεγχος αν υπάρχει ήδη προσομοίωση σε εξέλιξη
+            if self.simulation_in_progress:
+                return {
+                    "success": False,
+                    "message": "Another simulation is already in progress"
+                }
+                
+            async with self.simulation_lock:
+                self.simulation_in_progress = True
+                try:
+                    if not self.node.peers:
+                        return {"success": False, "message": "No peers available for partition"}
+                    
+                    # Αποσύνδεση από έναν τυχαίο peer
+                    # Προτιμάμε σταθερή επιλογή αντί για τυχαία
+                    peers_to_disconnect = [self.node.peers[0]] if self.node.peers else []
+                    
+                    if not peers_to_disconnect:
+                        return {"success": False, "message": "No peers available for partition"}
+                        
+                    logger.info(f"Simulating network partition: disconnecting from {peers_to_disconnect}")
+                    self.node.rpc.disconnect_peers(peers_to_disconnect)
+                    
+                    # Επανασύνδεση μετά από καθυστέρηση
+                    task = asyncio.create_task(self._reconnect_all_peers_after_delay(10))
+                    self.background_tasks.add(task)
+                    task.add_done_callback(self.background_tasks.discard)
+                    
+                    return {"success": True, "message": f"Network partition simulated, disconnected from {peers_to_disconnect}"}
+                finally:
+                    # Απελευθέρωση του lock μετά από καθυστέρηση
+                    asyncio.create_task(self._release_simulation_lock(10))
         
         @self.app.post("/simulation/force-election")
         async def force_election_timeout() -> Dict[str, Any]:
             """Force an election timeout."""
-            logger.info(f"Forcing election timeout for node {self.node.node_id}")
-            # Εξαναγκάστε τον κόμβο να ξεκινήσει εκλογή
-            await self.node.start_election()
-            return {"success": True, "message": "Election timeout forced"}
+            # Έλεγχος αν υπάρχει ήδη προσομοίωση σε εξέλιξη
+            if self.simulation_in_progress:
+                return {
+                    "success": False,
+                    "message": "Another simulation is already in progress"
+                }
+                
+            async with self.simulation_lock:
+                self.simulation_in_progress = True
+                try:
+                    logger.info(f"Forcing election timeout for node {self.node.node_id}")
+                    # Εξαναγκάστε τον κόμβο να ξεκινήσει εκλογή
+                    await self.node.start_election()
+                    return {"success": True, "message": "Election timeout forced"}
+                finally:
+                    # Απελευθέρωση του lock μετά από καθυστέρηση
+                    asyncio.create_task(self._release_simulation_lock(5))
         
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -225,6 +279,12 @@ class RaftAPI:
         self.node.rpc.reconnect_all_peers()
         logger.info(f"All peers reconnected for node {self.node.node_id}")
         await self.broadcast_update()
+    
+    async def _release_simulation_lock(self, delay: int) -> None:
+        """Release simulation lock after a delay."""
+        await asyncio.sleep(delay)
+        self.simulation_in_progress = False
+        logger.info("Simulation lock released")
     
     async def broadcast_update(self) -> None:
         """Broadcast current state to all websocket clients."""

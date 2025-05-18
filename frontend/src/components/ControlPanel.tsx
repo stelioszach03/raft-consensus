@@ -1,7 +1,7 @@
-import React, { useState } from 'react'
-import { motion } from 'framer-motion'
+import React, { useState, useEffect } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import axios from 'axios'
-import { Send, Plus, Trash, Key, RefreshCw, AlertTriangle } from 'lucide-react'
+import { Send, Plus, Trash, Key, RefreshCw, AlertTriangle, Clock } from 'lucide-react'
 
 const ControlPanel: React.FC = () => {
   const [key, setKey] = useState('')
@@ -10,6 +10,24 @@ const ControlPanel: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false)
   const [result, setResult] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
+  
+  // Προσθήκα κατάστασης για τις προσομοιώσεις
+  const [isSimulationRunning, setIsSimulationRunning] = useState(false)
+  const [simulationMessage, setSimulationMessage] = useState<string | null>(null)
+  const [simulationCountdown, setSimulationCountdown] = useState(0)
+  
+  // Το countdown για τις προσομοιώσεις
+  useEffect(() => {
+    if (simulationCountdown > 0) {
+      const timer = setTimeout(() => {
+        setSimulationCountdown(simulationCountdown - 1)
+      }, 1000)
+      return () => clearTimeout(timer)
+    } else if (simulationCountdown === 0 && isSimulationRunning) {
+      setIsSimulationRunning(false)
+      setSimulationMessage(null)
+    }
+  }, [simulationCountdown, isSimulationRunning])
   
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -24,14 +42,40 @@ const ControlPanel: React.FC = () => {
         ...(operation === 'set' && { value }),
       }
       
-      // Changed from /api/command to /command
-      const response = await axios.post('/command', command)
-      setResult(response.data)
+      // Προσθήκη retry λογικής
+      let retries = 0
+      const maxRetries = 3
+      let success = false
+      let response
       
-      // Reset form if successful
-      if (response.data.success && operation === 'set') {
-        setKey('')
-        setValue('')
+      while (!success && retries < maxRetries) {
+        try {
+          response = await axios.post('/command', command)
+          success = response.data.success
+          
+          if (!success && response.data.retry) {
+            retries++
+            await new Promise(resolve => setTimeout(resolve, 500))
+          } else {
+            break
+          }
+        } catch (err) {
+          retries++
+          await new Promise(resolve => setTimeout(resolve, 500))
+        }
+      }
+      
+      if (success && response) {
+        setResult(response.data)
+        
+        // Reset form if successful
+        if (operation === 'set') {
+          setKey('')
+          setValue('')
+        }
+      } else {
+        setError(response?.data?.error || 'Failed to execute command after multiple attempts')
+        setResult(response?.data)
       }
     } catch (err) {
       console.error('Error executing command:', err)
@@ -41,34 +85,79 @@ const ControlPanel: React.FC = () => {
     }
   }
   
-  // Νέες λειτουργίες για προσομοιώσεις
+  // Νέες λειτουργίες για προσομοιώσεις με προστασία από ταυτόχρονη εκτέλεση
   const handleNodeFailure = async () => {
+    if (isSimulationRunning) {
+      alert('Simulation already in progress. Please wait.')
+      return
+    }
+
     try {
+      setIsSimulationRunning(true)
+      setSimulationMessage('Node failure simulation in progress...')
+      setSimulationCountdown(10)  // 10 second countdown
+      
       const response = await axios.post('/simulation/node-failure')
-      alert(response.data.message || 'Node failure simulated')
+      if (response.data.success) {
+        setSimulationMessage(response.data.message || 'Node failure simulated')
+      } else {
+        setSimulationMessage(response.data.message || 'Failed to simulate node failure')
+        setSimulationCountdown(2) // Short countdown for failure
+      }
     } catch (err) {
       console.error('Error simulating node failure:', err)
-      alert('Failed to simulate node failure')
+      setSimulationMessage('Failed to simulate node failure')
+      setSimulationCountdown(2) // Short countdown for error
     }
   }
   
   const handleNetworkPartition = async () => {
+    if (isSimulationRunning) {
+      alert('Simulation already in progress. Please wait.')
+      return
+    }
+
     try {
+      setIsSimulationRunning(true)
+      setSimulationMessage('Network partition simulation in progress...')
+      setSimulationCountdown(15)  // 15 second countdown
+      
       const response = await axios.post('/simulation/network-partition')
-      alert(response.data.message || 'Network partition simulated')
+      if (response.data.success) {
+        setSimulationMessage(response.data.message || 'Network partition simulated')
+      } else {
+        setSimulationMessage(response.data.message || 'Failed to simulate network partition')
+        setSimulationCountdown(2) // Short countdown for failure
+      }
     } catch (err) {
       console.error('Error simulating network partition:', err)
-      alert('Failed to simulate network partition')
+      setSimulationMessage('Failed to simulate network partition')
+      setSimulationCountdown(2) // Short countdown for error
     }
   }
   
   const handleForceElection = async () => {
+    if (isSimulationRunning) {
+      alert('Simulation already in progress. Please wait.')
+      return
+    }
+
     try {
+      setIsSimulationRunning(true)
+      setSimulationMessage('Forcing election timeout...')
+      setSimulationCountdown(10)  // 10 second countdown
+      
       const response = await axios.post('/simulation/force-election')
-      alert(response.data.message || 'Election timeout forced')
+      if (response.data.success) {
+        setSimulationMessage(response.data.message || 'Election timeout forced')
+      } else {
+        setSimulationMessage(response.data.message || 'Failed to force election timeout')
+        setSimulationCountdown(2) // Short countdown for failure
+      }
     } catch (err) {
       console.error('Error forcing election timeout:', err)
-      alert('Failed to force election timeout')
+      setSimulationMessage('Failed to force election timeout')
+      setSimulationCountdown(2) // Short countdown for error
     }
   }
   
@@ -143,7 +232,7 @@ const ControlPanel: React.FC = () => {
             <button
               type="submit"
               className="flex items-center justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={isLoading}
+              disabled={isLoading || isSimulationRunning}
             >
               {isLoading ? (
                 <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
@@ -187,27 +276,66 @@ const ControlPanel: React.FC = () => {
             These actions simulate different scenarios in a Raft cluster. They will affect the actual cluster state.
           </p>
           
+          {/* Μήνυμα κατάστασης προσομοίωσης */}
+          <AnimatePresence>
+            {isSimulationRunning && simulationMessage && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md"
+              >
+                <div className="flex items-center">
+                  <Clock className="h-5 w-5 text-blue-400 dark:text-blue-500 mr-2" />
+                  <div>
+                    <span className="text-sm text-blue-700 dark:text-blue-400">{simulationMessage}</span>
+                    {simulationCountdown > 0 && (
+                      <div className="text-xs text-blue-500 dark:text-blue-300 mt-1">
+                        Simulation will complete in {simulationCountdown} seconds
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+          
           <div className="space-y-3">
             <button
               type="button"
-              className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              className={`w-full flex items-center justify-center px-4 py-2 border ${
+                isSimulationRunning
+                ? 'border-gray-200 dark:border-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
+                : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+              } text-sm font-medium rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500`}
               onClick={handleNodeFailure}
+              disabled={isSimulationRunning}
             >
               Simulate Node Failure
             </button>
             
             <button
               type="button"
-              className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              className={`w-full flex items-center justify-center px-4 py-2 border ${
+                isSimulationRunning
+                ? 'border-gray-200 dark:border-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
+                : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+              } text-sm font-medium rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500`}
               onClick={handleNetworkPartition}
+              disabled={isSimulationRunning}
             >
               Simulate Network Partition
             </button>
             
             <button
               type="button"
-              className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              className={`w-full flex items-center justify-center px-4 py-2 border ${
+                isSimulationRunning
+                ? 'border-gray-200 dark:border-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
+                : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+              } text-sm font-medium rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500`}
               onClick={handleForceElection}
+              disabled={isSimulationRunning}
             >
               Force Election Timeout
             </button>

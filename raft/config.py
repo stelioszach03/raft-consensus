@@ -18,9 +18,9 @@ class RaftConfig:
     port: int
     
     # Timing settings (in milliseconds)
-    election_timeout_min: int = 500
-    election_timeout_max: int = 2000  # Αυξημένο από 1000 σε 2000
-    heartbeat_interval: int = 100     # Αυξημένο από 50 σε 100
+    election_timeout_min: int = 2000    # Αυξημένο από 500 σε 2000
+    election_timeout_max: int = 4000    # Αυξημένο από 2000 σε 4000
+    heartbeat_interval: int = 500       # Αυξημένο από 100 σε 500
     
     # Storage settings
     storage_dir: str = "data"
@@ -30,9 +30,20 @@ class RaftConfig:
     
     @property
     def random_election_timeout(self) -> float:
-        """Generate a random election timeout in the configured range."""
-        return random.uniform(self.election_timeout_min / 1000,
-                              self.election_timeout_max / 1000)
+        """Generate a random election timeout in the configured range.
+        
+        Returns a node-specific timeout to prevent simultaneous elections.
+        """
+        # Χρήση του node_id για σταθερή διαφοροποίηση μεταξύ κόμβων
+        node_num = int(self.node_id.replace('node', '')) if self.node_id.startswith('node') else 0
+        node_offset = node_num * 200  # 200ms διαφορά μεταξύ κόμβων
+        
+        # Τυχαία τιμή μέσα στο εύρος, με προσθήκη του offset
+        base_timeout = self.election_timeout_min 
+        max_random = self.election_timeout_max - self.election_timeout_min
+        timeout = (base_timeout + node_offset + random.uniform(0, max_random)) / 1000
+        
+        return timeout
     
     @property
     def heartbeat_interval_seconds(self) -> float:
