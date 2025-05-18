@@ -64,7 +64,7 @@ const Dashboard: React.FC<DashboardProps> = ({ clusterState, logEntries = [] }) 
     transition: { 
       duration: 2,
       repeat: Infinity,
-      repeatType: "loop"
+      repeatType: "loop" as const  // Διόρθωση: Βεβαιωθείτε ότι ο τύπος καθορίζεται σωστά
     }
   }
   

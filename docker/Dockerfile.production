@@ -1,0 +1,36 @@
+# Fix for Dashboard.tsx TypeScript error
+RUN sed -i 's/repeatType: "loop"/repeatType: "loop" as const/g' src/components/Dashboard.tsx
+
+# Build the frontend
+RUN npm run build
+
+# Stage 2: Build the Python backend
+FROM python:3.10-slim AS backend
+
+# Set working directory
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install WebSocket dependencies
+RUN pip install --no-cache-dir websockets
+
+# Copy Python backend code
+COPY raft/ ./raft/
+COPY api/ ./api/
+COPY cli/ ./cli/
+COPY tests/ ./tests/
+COPY pyproject.toml ./
+
+# Copy the built frontend from the frontend-builder stage
+COPY --from=frontend-builder /app/frontend/out ./frontend/out
+
+# Expose ports
+# 7000-7002: Raft node RPC
+# 8000-8002: API server
+EXPOSE 7000-7002 8000-8002
+
+# Set entrypoint to Python
+ENTRYPOINT ["python"]

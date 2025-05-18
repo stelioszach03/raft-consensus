@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Dict, Any, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -152,8 +153,21 @@ class RaftAPI:
                 logger.info("WebSocket disconnected")
                 self.websocket_manager.disconnect(websocket)
         
-        # ΠΡΟΒΛΗΜΑ: Το frontend/build δεν υπάρχει, οπότε σχολιάζουμε αυτή τη γραμμή
-        # self.app.mount("/", StaticFiles(directory="frontend/build", html=True), name="frontend")
+        # Check multiple possible frontend directories
+        frontend_dirs = ["frontend/out", "frontend/.next", "frontend/build"]
+        frontend_dir = None
+        
+        for dir_path in frontend_dirs:
+            if os.path.exists(dir_path):
+                frontend_dir = dir_path
+                logger.info(f"Found frontend files in {frontend_dir}")
+                break
+                
+        if frontend_dir:
+            logger.info(f"Mounting frontend static files from {frontend_dir}")
+            self.app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+        else:
+            logger.warning(f"No frontend directory found. Static file serving disabled.")
         
         logger.info("API routes set up successfully")
     

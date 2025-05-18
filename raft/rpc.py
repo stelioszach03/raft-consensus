@@ -141,4 +141,4 @@ class RaftRPC:
             return {"term": term, "success": False}
         except Exception as e:
             logger.error(f"Error appending entries to {node_address}: {e}")
-            return {"term": term, "success": False}
+            return {"term": term, "success": False} 

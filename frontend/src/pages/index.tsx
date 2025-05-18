@@ -18,8 +18,27 @@ export default function Home() {
   
   useEffect(() => {
     console.log('Initializing WebSocket connection')
-    // Initialize WebSocket connection - use port 8100 instead of 8000
-    const manager = new WebSocketManager('ws://localhost:8100/ws')
+    
+    // Λήψη του hostname δυναμικά από το τρέχον URL
+    const hostname = window.location.hostname
+    
+    // Λήψη της θύρας - αν προσπελαύνουμε μέσω της θύρας 8100, συνδεόμαστε στο WebSocket αυτού του κόμβου
+    const urlPort = window.location.port
+    
+    // Αντιστοίχιση θυρών frontend σε θύρες WebSocket backend
+    let wsPort = '8000'
+    if (urlPort === '8101') wsPort = '8001'
+    if (urlPort === '8102') wsPort = '8002'
+    
+    // Αν δεν έχει καθοριστεί θύρα (π.χ., σε περιβάλλον παραγωγής), χρησιμοποιούμε την καθορισμένη θύρα hostname
+    const port = urlPort ? wsPort : '8100'
+    
+    // Δημιουργία του URL WebSocket
+    // Χρησιμοποιούμε το ίδιο hostname στο οποίο συνδέεται ο χρήστης
+    const wsUrl = `ws://${hostname}:${port}/ws`
+    
+    // Αρχικοποίηση της σύνδεσης WebSocket
+    const manager = new WebSocketManager(wsUrl)
     
     manager.onMessage((message) => {
       console.log('Received message:', message)
