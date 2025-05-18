@@ -18,9 +18,9 @@ class RaftConfig:
     port: int
     
     # Timing settings (in milliseconds)
-    election_timeout_min: int = 150
-    election_timeout_max: int = 300
-    heartbeat_interval: int = 50
+    election_timeout_min: int = 500
+    election_timeout_max: int = 2000  # Αυξημένο από 1000 σε 2000
+    heartbeat_interval: int = 100     # Αυξημένο από 50 σε 100
     
     # Storage settings
     storage_dir: str = "data"

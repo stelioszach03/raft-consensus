@@ -1,11 +1,19 @@
-# Fix for Dashboard.tsx TypeScript error
-RUN sed -i 's/repeatType: "loop"/repeatType: "loop" as const/g' src/components/Dashboard.tsx
+# Stage 1: Build the frontend
+FROM node:18-alpine AS frontend-builder
+
+WORKDIR /app/frontend
+
+# Copy frontend files
+COPY frontend/ ./
+
+# Install dependencies
+RUN npm ci
 
 # Build the frontend
 RUN npm run build
 
 # Stage 2: Build the Python backend
-FROM python:3.10-slim AS backend
+FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
@@ -13,9 +21,6 @@ WORKDIR /app
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install WebSocket dependencies
-RUN pip install --no-cache-dir websockets
 
 # Copy Python backend code
 COPY raft/ ./raft/

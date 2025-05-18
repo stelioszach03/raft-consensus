@@ -2,6 +2,7 @@
 import enum
 import json
 import time
+import random
 from typing import Dict, Optional, Any, List
 
 
@@ -64,6 +65,9 @@ class VolatileState:
         self.state = NodeState.FOLLOWER
         self.leader_id: Optional[str] = None
         self.last_heartbeat_time = 0.0
+        
+        # Προσθέστε διαφορετική καθυστέρηση για κάθε κόμβο για να αποφύγετε ταυτόχρονες εκλογές
+        time.sleep(random.uniform(0.1, 0.3))
     
     def update_heartbeat(self) -> None:
         """Update the last time a heartbeat was received."""

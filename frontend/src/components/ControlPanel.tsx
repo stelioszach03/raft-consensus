@@ -24,7 +24,8 @@ const ControlPanel: React.FC = () => {
         ...(operation === 'set' && { value }),
       }
       
-      const response = await axios.post('/api/command', command)
+      // Changed from /api/command to /command
+      const response = await axios.post('/command', command)
       setResult(response.data)
       
       // Reset form if successful
@@ -37,6 +38,37 @@ const ControlPanel: React.FC = () => {
       setError('Failed to execute command. Please try again.')
     } finally {
       setIsLoading(false)
+    }
+  }
+  
+  // Νέες λειτουργίες για προσομοιώσεις
+  const handleNodeFailure = async () => {
+    try {
+      const response = await axios.post('/simulation/node-failure')
+      alert(response.data.message || 'Node failure simulated')
+    } catch (err) {
+      console.error('Error simulating node failure:', err)
+      alert('Failed to simulate node failure')
+    }
+  }
+  
+  const handleNetworkPartition = async () => {
+    try {
+      const response = await axios.post('/simulation/network-partition')
+      alert(response.data.message || 'Network partition simulated')
+    } catch (err) {
+      console.error('Error simulating network partition:', err)
+      alert('Failed to simulate network partition')
+    }
+  }
+  
+  const handleForceElection = async () => {
+    try {
+      const response = await axios.post('/simulation/force-election')
+      alert(response.data.message || 'Election timeout forced')
+    } catch (err) {
+      console.error('Error forcing election timeout:', err)
+      alert('Failed to force election timeout')
     }
   }
   
@@ -152,15 +184,14 @@ const ControlPanel: React.FC = () => {
         <div className="border dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 p-6 shadow-sm">
           <h3 className="text-lg font-medium mb-4">Simulations</h3>
           <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-            These actions simulate different scenarios in a Raft cluster. Note that these are UI-only
-            demonstrations and don't affect the actual cluster state.
+            These actions simulate different scenarios in a Raft cluster. They will affect the actual cluster state.
           </p>
           
           <div className="space-y-3">
             <button
               type="button"
               className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
-              onClick={() => alert('This is a UI simulation - in a real implementation, this would trigger a node failure.')}
+              onClick={handleNodeFailure}
             >
               Simulate Node Failure
             </button>
@@ -168,7 +199,7 @@ const ControlPanel: React.FC = () => {
             <button
               type="button"
               className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
-              onClick={() => alert('This is a UI simulation - in a real implementation, this would trigger a network partition.')}
+              onClick={handleNetworkPartition}
             >
               Simulate Network Partition
             </button>
@@ -176,7 +207,7 @@ const ControlPanel: React.FC = () => {
             <button
               type="button"
               className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
-              onClick={() => alert('This is a UI simulation - in a real implementation, this would force an election timeout.')}
+              onClick={handleForceElection}
             >
               Force Election Timeout
             </button>

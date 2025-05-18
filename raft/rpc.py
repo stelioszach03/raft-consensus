@@ -2,7 +2,7 @@
 import asyncio
 import json
 import logging
-from typing import Dict, List, Any, Optional, Tuple, Callable
+from typing import Dict, List, Any, Optional, Tuple, Callable, Set
 
 import aiohttp
 from aiohttp import web
@@ -20,6 +20,10 @@ class RaftRPC:
         self.server = None
         self.app = web.Application()
         self.session = None
+        
+        # Προσθέστε αυτές τις ιδιότητες για τις προσομοιώσεις
+        self.disable_network = False
+        self.disconnected_peers: Set[str] = set()
         
         # Register RPC handlers
         self.vote_handler: Optional[Callable] = None
@@ -88,10 +92,26 @@ class RaftRPC:
             logger.error(f"Error handling append entries: {e}")
             return web.Response(status=500, text=str(e))
     
+    def disconnect_peers(self, peers: List[str]) -> None:
+        """Disconnect from specific peers."""
+        for peer in peers:
+            self.disconnected_peers.add(peer)
+        logger.info(f"Disconnected from peers: {peers}")
+    
+    def reconnect_all_peers(self) -> None:
+        """Reconnect to all peers."""
+        self.disconnected_peers.clear()
+        logger.info("Reconnected to all peers")
+    
     async def request_vote(self, node_address: str, term: int, 
                           candidate_id: str, last_log_index: int, 
                           last_log_term: int) -> Dict[str, Any]:
         """Send a RequestVote RPC to a node."""
+        # Προσθήκη ελέγχου κατάστασης δικτύου για προσομοιώσεις
+        if self.disable_network or node_address in self.disconnected_peers:
+            logger.info(f"Network disabled or peer {node_address} disconnected, vote request failed")
+            return {"term": term, "vote_granted": False}
+            
         url = f"http://{node_address}/raft/vote"
         data = {
             "term": term,
@@ -119,6 +139,11 @@ class RaftRPC:
                             prev_log_term: int, entries: List[Dict[str, Any]],
                             leader_commit: int) -> Dict[str, Any]:
         """Send an AppendEntries RPC to a node."""
+        # Προσθήκη ελέγχου κατάστασης δικτύου για προσομοιώσεις
+        if self.disable_network or node_address in self.disconnected_peers:
+            logger.info(f"Network disabled or peer {node_address} disconnected, append entries failed")
+            return {"term": term, "success": False}
+            
         url = f"http://{node_address}/raft/append"
         data = {
             "term": term,
@@ -141,4 +166,4 @@ class RaftRPC:
             return {"term": term, "success": False}
         except Exception as e:
             logger.error(f"Error appending entries to {node_address}: {e}")
-            return {"term": term, "success": False} 
+            return {"term": term, "success": False}

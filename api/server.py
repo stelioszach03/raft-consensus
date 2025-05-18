@@ -116,6 +116,45 @@ class RaftAPI:
             
             return result
         
+        # Νέα endpoints για προσομοιώσεις
+        @self.app.post("/simulation/node-failure")
+        async def simulate_node_failure() -> Dict[str, Any]:
+            """Simulate a node failure."""
+            logger.info(f"Simulating node failure for node {self.node.node_id}")
+            # Αποσύνδεση προσωρινά από το δίκτυο
+            self.node.rpc.disable_network = True
+            # Επανασύνδεση μετά από καθυστέρηση
+            task = asyncio.create_task(self._reconnect_after_delay(5))
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            return {"success": True, "message": "Node network disabled temporarily"}
+        
+        @self.app.post("/simulation/network-partition")
+        async def simulate_network_partition() -> Dict[str, Any]:
+            """Simulate a network partition."""
+            if not self.node.peers:
+                return {"success": False, "message": "No peers available for partition"}
+            
+            # Αποσύνδεση από τους μισούς peers
+            peers_to_disconnect = self.node.peers[:len(self.node.peers)//2]
+            logger.info(f"Simulating network partition: disconnecting from {peers_to_disconnect}")
+            self.node.rpc.disconnect_peers(peers_to_disconnect)
+            
+            # Επανασύνδεση μετά από καθυστέρηση
+            task = asyncio.create_task(self._reconnect_all_peers_after_delay(10))
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            
+            return {"success": True, "message": f"Network partition simulated, disconnected from {peers_to_disconnect}"}
+        
+        @self.app.post("/simulation/force-election")
+        async def force_election_timeout() -> Dict[str, Any]:
+            """Force an election timeout."""
+            logger.info(f"Forcing election timeout for node {self.node.node_id}")
+            # Εξαναγκάστε τον κόμβο να ξεκινήσει εκλογή
+            await self.node.start_election()
+            return {"success": True, "message": "Election timeout forced"}
+        
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
             """WebSocket endpoint for real-time updates."""
@@ -170,6 +209,22 @@ class RaftAPI:
             logger.warning(f"No frontend directory found. Static file serving disabled.")
         
         logger.info("API routes set up successfully")
+    
+    async def _reconnect_after_delay(self, delay: int) -> None:
+        """Re-enable network after a delay."""
+        logger.info(f"Will reconnect node {self.node.node_id} to network after {delay} seconds")
+        await asyncio.sleep(delay)
+        self.node.rpc.disable_network = False
+        logger.info(f"Node {self.node.node_id} network reconnected")
+        await self.broadcast_update()
+    
+    async def _reconnect_all_peers_after_delay(self, delay: int) -> None:
+        """Reconnect all peers after a delay."""
+        logger.info(f"Will reconnect all peers for node {self.node.node_id} after {delay} seconds")
+        await asyncio.sleep(delay)
+        self.node.rpc.reconnect_all_peers()
+        logger.info(f"All peers reconnected for node {self.node.node_id}")
+        await self.broadcast_update()
     
     async def broadcast_update(self) -> None:
         """Broadcast current state to all websocket clients."""
