@@ -1,11 +1,12 @@
-# Δημιουργία του αρχείου docker/docker-compose.yml
+version: '3.8'
+
 services:
   node0:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node0
-    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
+    # Χρήση σωστής διευθυνσιοδότησης για το cluster
     command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8000", "--debug"]
     ports:
       - "7100:7000"
@@ -13,17 +14,12 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      raft_network:
-        aliases:
-          # Προσθήκη και των δύο ονομάτων ως aliases
-          - node0 
-          - raft-node0
-    hostname: raft-node0
+      - raft_network
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7000/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/status" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -34,7 +30,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node1
-    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
     command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8001", "--debug"]
     ports:
       - "7101:7001"
@@ -42,12 +37,7 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      raft_network:
-        aliases:
-          # Προσθήκη και των δύο ονομάτων ως aliases
-          - node1
-          - raft-node1
-    hostname: raft-node1
+      - raft_network
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
@@ -55,7 +45,7 @@ services:
       node0:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7001/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/status"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -66,7 +56,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node2
-    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
     command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8002", "--debug"]
     ports:
       - "7102:7002"
@@ -74,12 +63,7 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      raft_network:
-        aliases:
-          # Προσθήκη και των δύο ονομάτων ως aliases
-          - node2
-          - raft-node2
-    hostname: raft-node2
+      - raft_network
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
@@ -87,7 +71,7 @@ services:
       node1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7002/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/status"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -96,11 +80,6 @@ services:
 networks:
   raft_network:
     driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.28.0.0/16
-          gateway: 172.28.0.1
 
 volumes:
   raft_data:

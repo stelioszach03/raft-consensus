@@ -3,6 +3,7 @@ import asyncio
 import logging
 import random
 import os
+import time
 from typing import Dict, List, Any, Optional, Set, Tuple
 
 from raft.config import RaftConfig
@@ -26,9 +27,16 @@ class RaftNode:
     def __init__(self, config: RaftConfig):
         self.config = config
         self.node_id = config.node_id
-        # Διόρθωση: Σωστός τρόπος φιλτραρίσματος peers, αφαιρώντας τον εαυτό μας
+        
+        # Ξεκάθαρη διεύθυνση κόμβου για RPC επικοινωνία
         self.node_address = f"{config.host}:{config.port}"
-        self.peers = [node for node in config.cluster_nodes if node != self.node_address]
+        
+        # Αναγνώριση peers - σαφέστερο φιλτράρισμα
+        self.peers = []
+        for peer in config.cluster_nodes:
+            if peer != self.node_address and peer not in self.peers:
+                self.peers.append(peer)
+                
         logger.info(f"Node {self.node_id} initialized with address {self.node_address}")
         logger.info(f"Node {self.node_id} initialized with peers: {self.peers}")
         
@@ -57,21 +65,51 @@ class RaftNode:
         
         # Cluster state information for UI
         self.cluster_state = ClusterState(self.node_id, config)
-        self.update_cluster_state()
         
-        # Προστασία από ταυτόχρονες εκλογές
+        # Βελτιωμένος μηχανισμός εκλογών
         self.election_in_progress = False
         self.last_election_time = 0.0
-        
-        # Μηχανισμός για αποφυγή διαδοχικών εκλογών από τον ίδιο κόμβο
         self.consecutive_elections = 0
         self.max_consecutive_elections = 3
         
-        # Χρόνος τελευταίας επιτυχούς εκλογής
-        self.last_successful_election_time = 0.0
+        # Σταθερότητα και αποφυγή flapping
+        self.min_election_timeout = config.election_timeout_min / 1000.0
+        self.leader_stability_timeout = self.min_election_timeout * 3
         
-        # Σταθερότητα εκλογών
-        self.election_stability_factor = 1.0
+        # Εξασφάλιση ότι εκκινούμε ως follower
+        self.volatile_state.state = NodeState.FOLLOWER
+        
+        # Ενημέρωση cluster state
+        self.update_cluster_state()
+        
+        # Προκαθορισμένος αρχικός ηγέτης
+        if self.node_id == "node0":
+            # node0 ξεκινά ως leader μετά από μικρή καθυστέρηση (για να επιτρέψει την αρχικοποίηση των άλλων)
+            asyncio.create_task(self._become_initial_leader())
+        else:
+            # Οι άλλοι κόμβοι περιμένουν περισσότερο για να αναγνωρίσουν τον αρχικό ηγέτη
+            node_num = int(self.node_id[-1])
+            election_delay = 2.0 + (node_num * 1.0)  # Διαφορετική καθυστέρηση για κάθε κόμβο
+            self.reset_election_timer_with_delay(election_delay)
+    
+    async def _become_initial_leader(self):
+        """Make this node the initial leader after a short delay."""
+        # Καθυστέρηση ώστε να αρχικοποιηθούν όλοι οι κόμβοι
+        await asyncio.sleep(1.0)
+        logger.info(f"Node {self.node_id} becoming initial leader")
+        
+        # Αύξηση του term και γίνεται ηγέτης
+        self.persistent_state.current_term += 1
+        self.become_leader()
+    
+    def reset_election_timer_with_delay(self, delay: float) -> None:
+        """Reset the election timeout timer with a specific delay."""
+        if self.election_timer:
+            self.election_timer.cancel()
+        
+        logger.info(f"Node {self.node_id} setting delayed election timeout: {delay:.2f}s")
+        
+        self.election_timer = asyncio.create_task(self.election_timeout(delay))
     
     async def start(self) -> None:
         """Start the Raft node."""
@@ -115,11 +153,13 @@ class RaftNode:
         if self.election_timer:
             self.election_timer.cancel()
         
-        # Χρήση του σταθερού τυχαίου timeout που εξαρτάται από το node_id
-        timeout = self.config.random_election_timeout
+        # Εξασφάλιση μοναδικού timeout βασισμένου στο node_id
+        node_num = int(self.node_id[-1])
+        base_timeout = self.config.election_timeout_min / 1000.0
+        # Αύξηση διαφοράς μεταξύ των timeouts
+        timeout = base_timeout + (node_num * 0.5) + random.uniform(0.1, 0.3)
         
-        # Καταγραφή για διαγνωστικούς σκοπούς
-        logger.debug(f"Node {self.node_id} setting election timeout: {timeout:.2f}s")
+        logger.info(f"Node {self.node_id} setting election timeout: {timeout:.2f}s")
         
         self.election_timer = asyncio.create_task(self.election_timeout(timeout))
     
@@ -131,9 +171,17 @@ class RaftNode:
         try:
             await asyncio.sleep(timeout)
             
+            # Αν υπάρχει ήδη leader, δεν ξεκινάμε εκλογή
+            if self.volatile_state.leader_id is not None:
+                logger.debug(f"Node {self.node_id} skipping election, already have leader {self.volatile_state.leader_id}")
+                self.reset_election_timer()
+                return
+                
             # Προστασία από πολύ συχνές εκλογές
             current_time = asyncio.get_event_loop().time()
-            if current_time - self.last_election_time < 1.0:
+            min_time_between_elections = 1.0
+            
+            if current_time - self.last_election_time < min_time_between_elections:
                 logger.debug(f"Node {self.node_id} skipping election, too soon after last one")
                 self.reset_election_timer()
                 return
@@ -145,8 +193,7 @@ class RaftNode:
                 
             if self.consecutive_elections >= self.max_consecutive_elections:
                 logger.debug(f"Node {self.node_id} has initiated too many consecutive elections, backing off")
-                # Αυξημένη καθυστέρηση όταν φτάνουμε το όριο διαδοχικών εκλογών
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await asyncio.sleep(random.uniform(1.0, 2.0) * (1 + (self.consecutive_elections - self.max_consecutive_elections) * 0.5))
                 self.consecutive_elections = 0
                 self.reset_election_timer()
                 return
@@ -164,15 +211,23 @@ class RaftNode:
         if self.election_in_progress:
             logger.debug(f"Node {self.node_id} already has an election in progress")
             return
+        
+        # Εισαγωγή καθυστέρησης με βάση το node_id για να αποφύγουμε συγχρονισμένες εκλογές
+        node_num = int(self.node_id[-1])
+        delay = node_num * 0.1  # Κλιμακούμενες καθυστερήσεις ανά κόμβο
+        logger.info(f"Node {self.node_id} waiting {delay}s before starting election")
+        await asyncio.sleep(delay)
+        
+        # Έλεγχος αν στο μεταξύ έχει εκλεγεί ηγέτης
+        if self.volatile_state.leader_id is not None:
+            logger.info(f"Node {self.node_id} cancelling election, leader {self.volatile_state.leader_id} already elected")
+            return
                 
         self.election_in_progress = True
         self.last_election_time = asyncio.get_event_loop().time()
         self.consecutive_elections += 1
         
         try:
-            # Υπολογισμός του stability factor - αυξάνεται με κάθε διαδοχική εκλογή
-            self.election_stability_factor = min(1.0 + (self.consecutive_elections * 0.2), 3.0)
-            
             # Increment current term
             self.persistent_state.current_term += 1
             new_term = self.persistent_state.current_term
@@ -197,7 +252,7 @@ class RaftNode:
             # Request votes from all peers
             vote_tasks = []
             for peer in self.peers:
-                # Διόρθωση: Βεβαιωθείτε ότι δεν ζητάμε ψήφο από τον εαυτό μας
+                # Βεβαιωθείτε ότι δεν ζητάμε ψήφο από τον εαυτό μας
                 if peer != self.node_address:
                     task = asyncio.create_task(
                         self.rpc.request_vote(
@@ -210,276 +265,141 @@ class RaftNode:
                     )
                     vote_tasks.append(task)
             
-            # Περιμένουμε απαντήσεις με timeout αλλά χωρίς να ακυρώνουμε tasks
-            if vote_tasks:
-                # Χρήση FIRST_COMPLETED αντί για wait_for για να αποφύγουμε την ακύρωση των tasks
-                # και αύξηση του timeout
-                done, pending = await asyncio.wait(
-                    vote_tasks,
-                    timeout=5.0,  # Αύξηση του timeout από 3.0 σε 5.0
-                    return_when=asyncio.FIRST_COMPLETED  # Επιστροφή μόλις ολοκληρωθεί οποιοδήποτε task
-                )
-                
-                # Επεξεργασία των ολοκληρωμένων tasks
-                for task in done:
-                    try:
-                        response = task.result()
-                        if response.get("vote_granted", False):
-                            votes_received += 1
-                            logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
-                        
-                        # If we got a higher term, revert to follower
-                        if response.get("term", 0) > self.persistent_state.current_term:
-                            logger.info(f"Node {self.node_id} discovered higher term during election")
-                            self.become_follower(response["term"])
-                            
-                            # Ακύρωση των υπόλοιπων pending tasks
-                            for t in pending:
-                                t.cancel()
-                            return
-                        
-                        # If we have enough votes, become leader
-                        if votes_received >= votes_needed:
-                            logger.info(f"Node {self.node_id} won election with {votes_received} votes")
-                            # Καταγραφή επιτυχούς εκλογής
-                            self.last_successful_election_time = asyncio.get_event_loop().time()
-                            self.consecutive_elections = 0  # Επαναφορά μετρητή
-                            
-                            # Ακύρωση των υπόλοιπων pending tasks
-                            for t in pending:
-                                t.cancel()
-                                
-                            self.become_leader()
-                            return
-                    except Exception as e:
-                        logger.warning(f"Error processing vote response: {e}")
-                
-                # Συνέχιση με τα εκκρεμή tasks
-                if pending:
-                    # Χρήση μεγαλύτερου timeout για τα υπόλοιπα tasks
-                    done2, pending2 = await asyncio.wait(
-                        pending, 
-                        timeout=10.0  # Δίνουμε περισσότερο χρόνο για τα εναπομείναντα
-                    )
-                    
-                    # Επεξεργασία των υπόλοιπων ολοκληρωμένων tasks
-                    for task in done2:
-                        try:
-                            response = task.result()
-                            if response.get("vote_granted", False):
-                                votes_received += 1
-                                logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
-                            
-                            # Check term and vote count again
-                            if response.get("term", 0) > self.persistent_state.current_term:
-                                logger.info(f"Node {self.node_id} discovered higher term during election (second phase)")
-                                self.become_follower(response["term"])
-                                
-                                # Ακύρωση των υπόλοιπων pending tasks
-                                for t in pending2:
-                                    t.cancel()
-                                return
-                            
-                            if votes_received >= votes_needed:
-                                logger.info(f"Node {self.node_id} won election with {votes_received} votes (second phase)")
-                                self.last_successful_election_time = asyncio.get_event_loop().time()
-                                self.consecutive_elections = 0
-                                
-                                # Ακύρωση των υπόλοιπων pending tasks
-                                for t in pending2:
-                                    t.cancel()
-                                    
-                                self.become_leader()
-                                return
-                        except Exception as e:
-                            logger.warning(f"Error processing vote response (second phase): {e}")
-                    
-                    # Ακύρωση τυχόν εναπομεινάντων tasks
-                    for t in pending2:
-                        t.cancel()
+            if not vote_tasks:
+                logger.warning(f"No peers available for vote requests")
+                self.election_in_progress = False
+                self.reset_election_timer()
+                return
             
-            # If we get here, we didn't win the election
-            logger.info(f"Node {self.node_id} lost election with {votes_received}/{votes_needed} votes, returning to follower state")
-            # Προσθήκα τυχαίας καθυστέρησης μετά από αποτυχημένη εκλογή
-            # Η καθυστέρηση αυξάνεται με βάση το stability factor
-            delay = random.uniform(1.0, 3.0) * self.election_stability_factor
-            logger.debug(f"Node {self.node_id} waiting for {delay:.2f}s before next election attempt")
-            await asyncio.sleep(delay)
-            self.become_follower(self.persistent_state.current_term)
+            # Περιμένουμε απαντήσεις με αυξημένο timeout
+            try:
+                results = await asyncio.gather(*vote_tasks, return_exceptions=True)
+                
+                # Process results
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning(f"Error in vote request: {result}")
+                        continue
+                        
+                    logger.info(f"Vote result: {result}")
+                    
+                    if result.get("vote_granted", False):
+                        votes_received += 1
+                        logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
+                    
+                    # If we got a higher term, revert to follower
+                    if result.get("term", 0) > self.persistent_state.current_term:
+                        logger.info(f"Node {self.node_id} discovered higher term during election")
+                        self.become_follower(result["term"])
+                        return
+                
+                # If we have enough votes, become leader
+                if votes_received >= votes_needed:
+                    logger.info(f"Node {self.node_id} won election with {votes_received} votes")
+                    self.consecutive_elections = 0
+                    self.become_leader()
+                else:
+                    # If we don't have enough votes, return to follower state
+                    logger.info(f"Node {self.node_id} lost election with {votes_received}/{votes_needed} votes")
+                    # Προσθήκα καθυστέρησης για αποφυγή συνεχών εκλογών
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+                    self.become_follower(self.persistent_state.current_term)
+            except Exception as e:
+                logger.error(f"Error in election process: {e}")
+                self.become_follower(self.persistent_state.current_term)
+                
         finally:
-            # Σημειώνουμε ότι η εκλογή ολοκληρώθηκε
+            # Mark the election as finished
             self.election_in_progress = False
     
     async def send_heartbeats(self) -> None:
         """Send heartbeats (empty AppendEntries) to all peers."""
-        heartbeat_delay = 0.01  # Short delay between heartbeats
-        
-        while (
-            not self.shutdown_event.is_set() and 
-            self.volatile_state.state == NodeState.LEADER
-        ):
-            try:
-                # Log for debugging
+        try:
+            while (
+                not self.shutdown_event.is_set() and 
+                self.volatile_state.state == NodeState.LEADER
+            ):
+                # Log
                 logger.debug(f"Leader {self.node_id} sending heartbeats to {len(self.peers)} peers")
                 
-                # Send heartbeats to all peers - βελτιωμένη χρήση gather για παράλληλη αποστολή
+                # We'll create a single task for each peer
                 heartbeat_tasks = []
-                for peer in self.peers:
-                    # Βεβαιωθείτε ότι δεν στέλνουμε heartbeat στον εαυτό μας
-                    if peer != self.node_address:
-                        prev_log_index = self.leader_state.next_index[peer] - 1 if self.leader_state else 0
-                        prev_log_term = 0
-                        
-                        if prev_log_index > 0:
-                            entry = self.log.get_entry(prev_log_index)
-                            if entry:
-                                prev_log_term = entry.term
-                        
-                        task = asyncio.create_task(
-                            self.rpc.append_entries(
-                                peer,
-                                self.persistent_state.current_term,
-                                self.node_id,
-                                prev_log_index,
-                                prev_log_term,
-                                [],  # Empty entries for heartbeat
-                                self.volatile_state.commit_index
-                            )
-                        )
-                        heartbeat_tasks.append((peer, task))
                 
-                # Περιμένουμε απαντήσεις αλλα με προστασία του gather από ακύρωση
-                if heartbeat_tasks:
-                    # Χρήση wait αντί για gather για να αποφύγουμε την ακύρωση όλων των tasks
-                    # όταν ένα αποτύχει
-                    remaining_time = self.config.heartbeat_interval_seconds
+                for peer in self.peers:
+                    # Get prev log info for this peer
+                    prev_log_index = self.leader_state.next_index[peer] - 1 if self.leader_state else 0
+                    prev_log_term = 0
                     
-                    # Διαιρούμε το χρόνο σε τρία μέρη: αποστολή, επεξεργασία, αναμονή
-                    send_timeout = min(remaining_time * 0.8, 1.0)  # Μέγιστο 1 δευτερόλεπτο
+                    if prev_log_index > 0:
+                        entry = self.log.get_entry(prev_log_index)
+                        if entry:
+                            prev_log_term = entry.term
                     
-                    all_tasks = [task for _, task in heartbeat_tasks]
+                    # Check if we need to send entries to this peer
+                    entries_to_send = []
+                    if self.leader_state and self.log.last_index >= self.leader_state.next_index[peer]:
+                        # Get entries to send
+                        log_entries = self.log.get_entries_from(self.leader_state.next_index[peer])
+                        if log_entries:
+                            entries_to_send = [entry.to_dict() for entry in log_entries]
                     
-                    # Χρήση wait με timeout
-                    done, pending = await asyncio.wait(
-                        all_tasks,
-                        timeout=send_timeout,
-                        return_when=asyncio.ALL_COMPLETED
+                    # Create task for this peer
+                    task = asyncio.create_task(
+                        self.rpc.append_entries(
+                            peer,
+                            self.persistent_state.current_term,
+                            self.node_id,
+                            prev_log_index,
+                            prev_log_term,
+                            entries_to_send,
+                            self.volatile_state.commit_index
+                        )
                     )
-                    
-                    # Επεξεργασία των απαντήσεων
-                    for peer, task in heartbeat_tasks:
-                        if task in done:
+                    heartbeat_tasks.append((peer, task))
+                
+                # Wait for all heartbeats with protection
+                if heartbeat_tasks:
+                    try:
+                        for peer, task in heartbeat_tasks:
                             try:
-                                response = task.result()
+                                response = await asyncio.wait_for(task, timeout=3.0)
                                 
-                                # Αν λάβουμε μεγαλύτερο term, revert to follower
+                                # If we get a higher term, become follower
                                 if response.get("term", 0) > self.persistent_state.current_term:
                                     logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
                                     self.become_follower(response["term"])
-                                    
-                                    # Ακύρωση τυχόν εκκρεμών εργασιών
-                                    for pending_task in pending:
-                                        pending_task.cancel()
                                     return
                                 
-                                # Αν επιτύχει, ελέγχουμε για εκκρεμείς καταχωρήσεις προς αντιγραφή
-                                if response.get("success", False) and self.needs_replication(peer):
-                                    asyncio.create_task(self.replicate_log(peer))
+                                # Process successful response
+                                if response.get("success", False):
+                                    # If we sent entries, update match index
+                                    if self.leader_state and len(entries_to_send) > 0:
+                                        last_sent_idx = prev_log_index + len(entries_to_send)
+                                        self.leader_state.update_follower_progress(peer, last_sent_idx)
+                                        
+                                        # Try to update commit index
+                                        self.update_commit_index()
+                                elif self.leader_state and self.leader_state.next_index[peer] > 1:
+                                    # Decrement next index for failed consistency check
+                                    self.leader_state.next_index[peer] -= 1
+                                
+                            except asyncio.TimeoutError:
+                                logger.warning(f"Timeout sending heartbeat to {peer}")
                             except Exception as e:
-                                logger.warning(f"Error processing heartbeat response from {peer}: {e}")
-                    
-                    # Ακύρωση τυχόν εκκρεμών εργασιών
-                    for pending_task in pending:
-                        pending_task.cancel()
+                                logger.error(f"Error sending heartbeat to {peer}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error in heartbeat processing: {e}")
                 
                 # Update cluster state for UI
                 self.update_cluster_state()
                 
                 # Wait before sending next heartbeat
                 await asyncio.sleep(self.config.heartbeat_interval_seconds)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error sending heartbeats: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
-    
-    def needs_replication(self, peer: str) -> bool:
-        """Check if a peer needs log replication."""
-        if not self.leader_state:
-            return False
-            
-        return self.log.last_index >= self.leader_state.next_index[peer]
-    
-    async def replicate_log(self, peer: str) -> None:
-        """Replicate log entries to a specific peer."""
-        if not self.leader_state:
-            logger.warning(f"Cannot replicate logs - no leader state")
-            return
-            
-        # Διόρθωση: Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
-        if peer == self.node_address:
-            return
-            
-        next_index = self.leader_state.next_index[peer]
-        
-        # Get the entries to send
-        entries_to_send = self.log.get_entries_from(next_index)
-        if not entries_to_send:
-            # No entries to send, this is just a heartbeat
-            return
-        
-        # Calculate previous log info
-        prev_log_index = next_index - 1
-        prev_log_term = 0
-        
-        if prev_log_index > 0:
-            entry = self.log.get_entry(prev_log_index)
-            if entry:
-                prev_log_term = entry.term
-        
-        # Convert entries to dicts for transmission
-        entries_dict = [entry.to_dict() for entry in entries_to_send]
-        
-        try:
-            # Χρήση asyncio.shield για προστασία από ακύρωση
-            shielded_task = asyncio.shield(
-                self.rpc.append_entries(
-                    peer,
-                    self.persistent_state.current_term,
-                    self.node_id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries_dict,
-                    self.volatile_state.commit_index
-                )
-            )
-            # Send append entries RPC
-            response = await shielded_task
-            
-            # Handle response
-            if response.get("term", 0) > self.persistent_state.current_term:
-                logger.info(f"Node {self.node_id} discovered higher term during replication")
-                self.become_follower(response["term"])
-                return
-            
-            if response.get("success", False):
-                # Update follower's progress
-                match_index = prev_log_index + len(entries_to_send)
-                if self.leader_state:  # Double-check leader state still exists
-                    self.leader_state.update_follower_progress(peer, match_index)
                 
-                # Try to advance commit index
-                self.update_commit_index()
-                logger.debug(f"Successfully replicated {len(entries_to_send)} entries to {peer}")
-            else:
-                # If failed, decrement nextIndex and try again
-                if self.leader_state and self.leader_state.next_index[peer] > 1:
-                    self.leader_state.next_index[peer] -= 1
-                    logger.debug(f"Log consistency failed for {peer}, decreasing nextIndex to {self.leader_state.next_index[peer]}")
-                    # Try again immediately
-                    await self.replicate_log(peer)
+        except asyncio.CancelledError:
+            logger.debug("Heartbeat task cancelled")
         except Exception as e:
-            logger.error(f"Error replicating log to {peer}: {e}", exc_info=True)
+            logger.error(f"Error in heartbeat loop: {e}")
     
     def update_commit_index(self) -> None:
         """
@@ -496,15 +416,15 @@ class RaftNode:
         # Sort to find the median (majority-replicated) index
         match_indices.sort()
         majority_index = len(match_indices) // 2
-        new_commit_index = match_indices[majority_index]
+        potential_commit_index = match_indices[majority_index]
         
-        # Only advance commit index for entries from current term or earlier terms
-        # that haven't been committed yet
-        if new_commit_index > self.volatile_state.commit_index:
-            entry = self.log.get_entry(new_commit_index)
-            if entry:
-                logger.info(f"Advancing commit index to {new_commit_index}")
-                self.volatile_state.commit_index = new_commit_index
+        # Only advance commit index for entries from current term
+        if potential_commit_index > self.volatile_state.commit_index:
+            # Verify the term of the entry at the potential commit index
+            entry = self.log.get_entry(potential_commit_index)
+            if entry and entry.term == self.persistent_state.current_term:
+                logger.info(f"Advancing commit index to {potential_commit_index}")
+                self.volatile_state.commit_index = potential_commit_index
     
     async def apply_committed_entries(self) -> None:
         """Apply committed log entries to the state machine."""
@@ -516,6 +436,9 @@ class RaftNode:
                 # Apply command to state machine
                 await self.apply_command(entry.command)
                 logger.info(f"Applied entry {self.volatile_state.last_applied} to state machine: {entry.command}")
+        
+        # Update UI state after applying entries
+        self.update_cluster_state()
     
     async def apply_command(self, command: Dict[str, Any]) -> Any:
         """Apply a command to the state machine."""
@@ -620,7 +543,7 @@ class RaftNode:
         entries = request.get("entries", [])
         leader_commit = request.get("leader_commit", 0)
         
-        # Log for debugging
+        # Log for debugging (limit for heartbeats)
         is_heartbeat = not entries
         if is_heartbeat:
             logger.debug(f"Node {self.node_id} received heartbeat from {leader_id} (term {term})")
@@ -637,20 +560,26 @@ class RaftNode:
         
         # Update state based on the valid AppendEntries
         self.volatile_state.update_heartbeat()
+        
+        # Very important! Update leader information
+        previous_leader = self.volatile_state.leader_id
         self.volatile_state.leader_id = leader_id
         
         # If the term is newer, update our term
         if term > self.persistent_state.current_term:
             logger.debug(f"Updating term from AppendEntries: {self.persistent_state.current_term} -> {term}")
             self.become_follower(term)
+        elif self.volatile_state.state != NodeState.FOLLOWER:
+            # Make sure we're a follower
+            logger.info(f"Node {self.node_id} changing from {self.volatile_state.state} to follower due to AppendEntries")
+            self.become_follower(term)
         else:
             # Reset election timer
             self.reset_election_timer()
-            
-            # Make sure we're a follower
-            if self.volatile_state.state != NodeState.FOLLOWER:
-                logger.info(f"Node {self.node_id} changing from {self.volatile_state.state} to follower due to AppendEntries")
-                self.become_follower(term)
+        
+        # If the leader changed, log it
+        if previous_leader != leader_id:
+            logger.info(f"Node {self.node_id} recognized new leader: {leader_id} for term {term}")
         
         # Check log consistency
         if not self.log.check_consistency(prev_log_index, prev_log_term):
@@ -672,8 +601,15 @@ class RaftNode:
         
         # Append entries to log
         if log_entries:
-            self.log.append_entries(prev_log_index, log_entries)
-            logger.debug(f"Appended {len(log_entries)} entries to log, now has {len(self.log.entries)} entries")
+            success = self.log.append_entries(prev_log_index, log_entries)
+            if success:
+                logger.debug(f"Appended {len(log_entries)} entries to log, now has {len(self.log.entries)} entries")
+            else:
+                logger.warning(f"Failed to append entries to log")
+                return {
+                    "term": self.persistent_state.current_term, 
+                    "success": False
+                }
         
         # Update commit index
         if leader_commit > self.volatile_state.commit_index:
@@ -697,118 +633,61 @@ class RaftNode:
         If leader, append to log and replicate.
         If follower, redirect to leader.
         """
-        # Προσθήκη retry λογικής
-        max_retries = 5  # Αυξήθηκε από 3
-        retry_delay = 0.3  # Μειώθηκε από 0.5
-        
-        for attempt in range(max_retries):
-            if self.volatile_state.state != NodeState.LEADER:
-                # Redirect to leader if known
-                if self.volatile_state.leader_id:
-                    logger.info(f"Redirecting client request to leader {self.volatile_state.leader_id}")
-                    # Εδώ θα μπορούσαμε να έχουμε κώδικα προώθησης, αλλά για απλότητα
-                    # απλά επιστρέφουμε την πληροφορία του ηγέτη
-                    return {
-                        "success": False,
-                        "leader": self.volatile_state.leader_id,
-                        "message": "Please retry with the leader node"
-                    }
-                else:
-                    # Αν δεν υπάρχει γνωστός ηγέτης, περιμένουμε λίγο και ξαναπροσπαθούμε
-                    if attempt < max_retries - 1:
-                        logger.debug(f"No known leader, retrying ({attempt+1}/{max_retries})")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    return {
-                        "success": False,
-                        "error": "No leader known - please try again later",
-                        "retry": True
-                    }
-            
-            # Αν φτάσαμε εδώ, είμαστε ο ηγέτης
-            logger.info(f"Leader {self.node_id} handling client request: {command}")
-            
-            try:
-                # Append to log
-                entry = self.log.append(self.persistent_state.current_term, command)
-                
-                # Replicate to followers using asyncio.shield για προστασία από ακύρωση
-                replication_tasks = []
-                for peer in self.peers:
-                    # Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
-                    if peer != self.node_address:
-                        task = asyncio.create_task(
-                            asyncio.shield(self.replicate_log(peer))
-                        )
-                        replication_tasks.append(task)
-                
-                # Wait for replication with timeout αλλά με χρήση wait αντί για wait_for
-                if replication_tasks:
-                    done, pending = await asyncio.wait(
-                        replication_tasks,
-                        timeout=10.0,  # Αυξημένο timeout
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                    
-                    # Ακύρωση των εκκρεμών tasks μετά το timeout
-                    for task in pending:
-                        task.cancel()
-                
-                # Wait for command to be applied
-                max_wait = 10.0  # Αυξημένο από 5.0 seconds
-                wait_start = asyncio.get_event_loop().time()
-                
-                while (
-                    self.volatile_state.last_applied < entry.index and
-                    asyncio.get_event_loop().time() - wait_start < max_wait
-                ):
-                    await asyncio.sleep(0.05)
-                
-                # Check if the command was applied
-                if self.volatile_state.last_applied >= entry.index:
-                    # Get result from state machine
-                    result = await self.apply_command(command)
-                    logger.info(f"Client request successful, applied to state machine: {command}")
-                    return {
-                        "success": True,
-                        "index": entry.index,
-                        "result": result
-                    }
-                else:
-                    logger.warning(f"Timeout waiting for replication of {command}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    return {
-                        "success": False,
-                        "error": "Timeout waiting for replication",
-                        "retry": True
-                    }
-            except Exception as e:
-                logger.error(f"Error handling client request: {e}", exc_info=True)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    continue
+        # Check if we're the leader
+        if self.volatile_state.state != NodeState.LEADER:
+            # Redirect to leader if known
+            if self.volatile_state.leader_id:
+                logger.info(f"Redirecting client request to leader {self.volatile_state.leader_id}")
                 return {
                     "success": False,
-                    "error": f"Error: {str(e)}",
+                    "leader": self.volatile_state.leader_id,
+                    "message": "Please retry with the leader node"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "No leader known - please try again later",
                     "retry": True
                 }
         
-        # Αν φτάσαμε εδώ, έχουν αποτύχει όλες οι προσπάθειες
-        return {
-            "success": False,
-            "error": "All retries failed",
-            "retry": True
-        }
+        # Handle the request as leader
+        logger.info(f"Leader {self.node_id} handling client request: {command}")
+        
+        try:
+            # Append to log
+            entry = self.log.append(self.persistent_state.current_term, command)
+            
+            # After appending to our log, we already know the result but need to replicate
+            result = await self.apply_command(command)
+            
+            # Update commit index for ourselves
+            self.update_commit_index()
+            
+            # Client request is successful as soon as we've processed it
+            # Eventual consistency will ensure it propagates to followers
+            return {
+                "success": True,
+                "index": entry.index,
+                "result": result
+            }
+        except Exception as e:
+            logger.error(f"Error handling client request: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Error: {str(e)}",
+                "retry": True
+            }
     
     def become_follower(self, term: int) -> None:
         """Transition to follower state."""
+        previous_state = self.volatile_state.state
         logger.info(f"Node {self.node_id} becoming follower for term {term}")
         
         # Update term if needed
         if term > self.persistent_state.current_term:
             self.persistent_state.update_term(term)
+            # Clear vote when term changes
+            self.persistent_state.voted_for = None
         
         # Update state
         self.volatile_state.state = NodeState.FOLLOWER
@@ -821,21 +700,12 @@ class RaftNode:
         # Reset leader state
         self.leader_state = None
         
-        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε follower
-        # μόνο αν έχει περάσει αρκετός χρόνος
-        current_time = asyncio.get_event_loop().time()
-        if current_time - self.last_election_time > 3.0:  # Μειωμένο από 5.0
+        # Reset consecutive elections only if becoming follower from another state
+        if previous_state != NodeState.FOLLOWER:
             self.consecutive_elections = 0
         
-        # Reset election timer με μεγαλύτερο timeout όταν γίνεται follower
-        # για να δώσει χρόνο στο σύστημα να σταθεροποιηθεί
-        if self.election_timer:
-            self.election_timer.cancel()
-
-        timeout = self.config.random_election_timeout * self.election_stability_factor
-        logger.debug(f"Node {self.node_id} setting election timeout as follower: {timeout:.2f}s")
-        
-        self.election_timer = asyncio.create_task(self.election_timeout(timeout))
+        # Reset election timer
+        self.reset_election_timer()
         
         # Update cluster state for UI
         self.update_cluster_state()
@@ -861,23 +731,24 @@ class RaftNode:
         self.volatile_state.state = NodeState.LEADER
         self.volatile_state.leader_id = self.node_id
         
-        # Initialize leader state
+        # Initialize leader state with all peers
         self.leader_state = LeaderState(self.peers)
         
         # Populate nextIndex with last log index + 1
         last_log_index = self.log.last_index
         for peer in self.peers:
             self.leader_state.next_index[peer] = last_log_index + 1
+            self.leader_state.match_index[peer] = 0
         
         # Cancel election timer
         if self.election_timer:
             self.election_timer.cancel()
             self.election_timer = None
         
-        # Append a no-op entry to commit any previous entries
-        self.log.append(self.persistent_state.current_term, {"operation": "no-op"})
+        # Append a no-op entry to establish leadership
+        no_op_entry = self.log.append(self.persistent_state.current_term, {"operation": "no-op"})
         
-        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε leader
+        # Reset consecutive elections
         self.consecutive_elections = 0
         
         # Start sending heartbeats
@@ -897,10 +768,19 @@ class RaftNode:
         self.cluster_state.commit_index = self.volatile_state.commit_index
         self.cluster_state.last_applied = self.volatile_state.last_applied
         
-        # Update peer information if we're the leader
-        if self.volatile_state.state == NodeState.LEADER and self.leader_state:
-            for peer in self.peers:
+        # Clear and update peer information
+        self.cluster_state.peers_status = {}
+        
+        # Update peer information (for all states, not just leader)
+        for peer in self.peers:
+            if self.volatile_state.state == NodeState.LEADER and self.leader_state:
+                # Include leader-specific info
                 self.cluster_state.peers_status[peer] = {
-                    "next_index": self.leader_state.next_index.get(peer),
-                    "match_index": self.leader_state.match_index.get(peer),
+                    "next_index": self.leader_state.next_index.get(peer, 0),
+                    "match_index": self.leader_state.match_index.get(peer, 0),
+                }
+            else:
+                # Basic info for followers and candidates
+                self.cluster_state.peers_status[peer] = {
+                    "active": True  # Assume peer is active
                 }

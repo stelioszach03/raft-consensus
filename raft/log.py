@@ -2,8 +2,10 @@
 import dataclasses
 import json
 import os
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class LogEntry:
@@ -40,6 +42,9 @@ class RaftLog:
     
     def _load(self) -> None:
         """Load log entries from disk."""
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        
         if not os.path.exists(self.log_path):
             return
         
@@ -47,10 +52,16 @@ class RaftLog:
             with open(self.log_path, "r") as f:
                 for line in f:
                     if line.strip():
-                        entry_data = json.loads(line)
-                        self.entries.append(LogEntry.from_dict(entry_data))
-        except (json.JSONDecodeError, KeyError):
-            # Log file might be corrupted, we'll start with an empty log
+                        try:
+                            entry_data = json.loads(line)
+                            self.entries.append(LogEntry.from_dict(entry_data))
+                        except json.JSONDecodeError:
+                            logger.error(f"Error decoding log entry: {line}")
+                        except KeyError as e:
+                            logger.error(f"Missing key in log entry: {e}")
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error loading log: {e}")
+            # Start with empty log on corruption
             self.entries = []
     
     def append(self, term: int, command: Dict[str, Any]) -> LogEntry:
@@ -60,8 +71,16 @@ class RaftLog:
         self.entries.append(entry)
         
         # Persist to disk
-        with open(self.log_path, "a") as f:
-            f.write(json.dumps(entry.to_dict()) + "\n")
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(entry.to_dict()) + "\n")
+            
+            logger.debug(f"Appended entry {index} to log with term {term}")
+        except IOError as e:
+            logger.error(f"Error writing to log: {e}")
         
         return entry
     
@@ -114,21 +133,45 @@ class RaftLog:
         
         # Delete any conflicting entries
         if start_idx < len(self.entries):
-            self.entries = self.entries[:start_idx]
+            # Check for conflicts
+            for i, new_entry in enumerate(entries):
+                log_idx = start_idx + i
+                
+                # If we've reached the end of our log, there are no more conflicts
+                if log_idx >= len(self.entries):
+                    break
+                
+                # If terms don't match, we have a conflict
+                if self.entries[log_idx].term != new_entry.term:
+                    # Delete this and all subsequent entries
+                    self.entries = self.entries[:log_idx]
+                    break
+            
+        # Append new entries (if any remaining after conflict check)
+        append_start_idx = len(self.entries)  # Where to start appending
+        entries_to_append = entries[append_start_idx - start_idx:] if append_start_idx > start_idx else entries
         
-        # Append the new entries
-        self.entries.extend(entries)
-        
-        # Persist to disk
-        self._rewrite_log()
+        if entries_to_append:
+            self.entries.extend(entries_to_append)
+            
+            # Persist to disk
+            self._rewrite_log()
+            
+            logger.debug(f"Appended {len(entries_to_append)} entries to log after conflict resolution")
         
         return True
     
     def _rewrite_log(self) -> None:
         """Rewrite the entire log file with current entries."""
-        with open(self.log_path, "w") as f:
-            for entry in self.entries:
-                f.write(json.dumps(entry.to_dict()) + "\n")
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            
+            with open(self.log_path, "w") as f:
+                for entry in self.entries:
+                    f.write(json.dumps(entry.to_dict()) + "\n")
+        except IOError as e:
+            logger.error(f"Error rewriting log: {e}")
     
     @property
     def last_index(self) -> int:
