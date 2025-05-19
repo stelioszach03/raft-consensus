@@ -1,167 +1,151 @@
-Raft Consensus Algorithm Implementation
-A Python library implementing the Raft consensus algorithm using asyncio. This implementation follows the protocol described in the paper "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout.
-Architecture
-mermaidgraph TD
-    Client[Client] --> API[API Server]
-    API --> Node[Raft Node]
-    Node --> RPC[RPC Communication]
-    Node --> Log[Log Management]
-    Node --> State[State Management]
-    RPC --- Node1[Raft Node 1]
-    RPC --- Node2[Raft Node 2]
-    RPC --- Node3[Raft Node 3]
-    subgraph "Raft Cluster"
-        Node1
-        Node2
-        Node3
-    end
-    UI[Web UI] --> API
-    style Node fill:#f9f,stroke:#333,stroke-width:2px
-    style Log fill:#bbf,stroke:#333,stroke-width:1px
-    style RPC fill:#bbf,stroke:#333,stroke-width:1px
-    style State fill:#bbf,stroke:#333,stroke-width:1px
-Raft Consensus Sequence
-mermaidsequenceDiagram
-    participant C as Client
-    participant L as Leader
-    participant F1 as Follower 1
-    participant F2 as Follower 2
-    
-    C->>L: Client Request
-    L->>L: Append to log
-    par Leader to Follower 1
-        L->>F1: AppendEntries RPC
-        F1->>F1: Verify log consistency
-        F1->>L: Success response
-    and Leader to Follower 2
-        L->>F2: AppendEntries RPC
-        F2->>F2: Verify log consistency
-        F2->>L: Success response
-    end
-    L->>L: Wait for majority commit
-    L->>L: Apply to state machine
-    L->>C: Response
-Leader Election Sequence
-mermaidsequenceDiagram
-    participant F1 as Follower 1
-    participant C as Candidate
-    participant F2 as Follower 2
-    
-    Note over F1,F2: Follower timeout
-    F1->>F1: Convert to candidate
-    F1->>C: Increment term<br/>Vote for self
-    
-    par Candidate to Follower 1
-        C->>F1: RequestVote RPC
-        F1->>C: Vote granted
-    and Candidate to Follower 2
-        C->>F2: RequestVote RPC
-        F2->>C: Vote granted
-    end
-    
-    C->>C: Received majority votes
-    C->>C: Become leader
-    C->>F1: AppendEntries (heartbeat)
-    C->>F2: AppendEntries (heartbeat)
-Features
+Here’s a polished, professional README for your Raft Consensus project:
 
-Complete implementation of the Raft consensus algorithm
-Leader election with randomized timeouts
-Log replication across the cluster
-Cluster membership management
-Persistent state using append-only logs
-REST API for client interaction
-WebSocket-based real-time UI
-CLI for node management
-Containerized deployment with Docker
+---
 
-Installation
-Using pip
-bashpip install raft-consensus
-Using Docker
-bash# Clone the repository
-git clone https://github.com/yourusername/raft-consensus.git
-cd raft-consensus
+# Raft-Consensus
 
-# Build and run with Docker Compose
-docker-compose -f docker/docker-compose.yml up
-Usage
-Starting a Raft node
-bash# Start the first node
-python -m cli.main --id node0 --host localhost --port 7000 --cluster "localhost:7000,localhost:7001,localhost:7002" --api-port 8000
+A production-grade, interactive implementation of the Raft consensus algorithm, complete with real-time visualization, fault-injection controls, and Dockerized cluster deployment.
 
-# Start the second node
-python -m cli.main --id node1 --host localhost --port 7001 --cluster "localhost:7000,localhost:7001,localhost:7002" --api-port 8001
+![Raft Consensus UI](https://raw.githubusercontent.com/stelioszach03/raft-consensus/main/docs/images/raft-ui.png)
 
-# Start the third node
-python -m cli.main --id node2 --host localhost --port 7002 --cluster "localhost:7000,localhost:7001,localhost:7002" --api-port 8002
-Using the API
-pythonimport asyncio
-import aiohttp
+---
 
-async def set_value():
-    async with aiohttp.ClientSession() as session:
-        # Set a key-value pair
-        async with session.post('http://localhost:8000/command', 
-                              json={'operation': 'set', 'key': 'mykey', 'value': 'myvalue'}) as resp:
-            print(await resp.json())
-        
-        # Get the value
-        async with session.post('http://localhost:8000/command', 
-                              json={'operation': 'get', 'key': 'mykey'}) as resp:
-            print(await resp.json())
+## 🚀 Quick Start
 
-asyncio.run(set_value())
-Using the Web UI
-The web UI is available at http://localhost:8000 when a node is started with the --api-port option.
-Development
-Prerequisites
+### 1. Clone & Launch with Docker
 
-Python 3.8+
-Node.js 14+ (for UI development)
+```bash
+git clone https://github.com/stelioszach03/raft-consensus.git
+cd raft-consensus/docker
+docker-compose up -d
+```
 
-Setting up the development environment
-bash# Clone the repository
-git clone https://github.com/yourusername/raft-consensus.git
-cd raft-consensus
+Give the cluster 15 seconds to stabilize, then open:
 
-# Install Python dependencies
+* Leader UI → [http://localhost:8100](http://localhost:8100)
+* Follower UIs → [http://localhost:8101](http://localhost:8101), [http://localhost:8102](http://localhost:8102)
+
+### 2. Manual Build & Run
+
+```bash
+# 1. Backend dependencies
 pip install -r requirements.txt
 
-# Install frontend dependencies
+# 2. Frontend
 cd frontend
-npm install
-Running tests
-bash# Run the Python tests
-pytest
+npm ci
+npm run build
+cd ..
 
-# Run the UI tests
-cd frontend
-npm test
-Project Structure
+# 3. Start three nodes in separate terminals
+python -m cli.main \
+  --id node0 --host localhost --port 7000 \
+  --cluster localhost:7000,localhost:7001,localhost:7002 \
+  --api-port 8100 --debug
 
-raft/: Core implementation
+# Repeat for node1 (port 7001/8101) and node2 (7002/8102)
 
-node.py: Raft node implementation
-log.py: Log storage and management
-rpc.py: Network communication
-state.py: State management
-config.py: Configuration handling
+# 4. Browse UIs on ports 8100, 8101, 8102
+```
 
+---
 
-cli/: Command-line interface
-api/: HTTP API server
-tests/: Test suite
-frontend/: Web UI
-docker/: Docker configuration
+## 🔍 Overview
 
-Contributing
+This project demonstrates a **strongly-consistent** key-value store using Raft. It highlights:
 
-Fork the repository
-Create your feature branch (git checkout -b feature/my-feature)
-Commit your changes (git commit -am 'Add some feature')
-Push to the branch (git push origin feature/my-feature)
-Create a new Pull Request
+* **Leader election** with randomized timeouts
+* **Log replication** and commitment only after majority acknowledgment
+* **Safety guarantees**: never overwriting committed entries
+* **Fault tolerance**: automatic re-elections after node/network failures
+* **Interactive UI**: visualize state, logs, elections, and inject failures
 
-License
-This project is licensed under the MIT License - see the LICENSE file for details.
+For in-depth protocol details, see the original Raft paper:
+
+> Diego Ongaro & John Ousterhout, “In Search of an Understandable Consensus Algorithm”
+> [https://raft.github.io/raft.pdf](https://raft.github.io/raft.pdf)
+
+---
+
+## ⚙️ Architecture
+
+```
+┌────────────┐    AppendEntries    ┌────────────┐    
+│  Leader    │ ─────────────────► │  Follower  │    
+│  (node0)   │                     │  (node1)   │    
+└────────────┘ ◄───────────────── └────────────┘    
+       │        RequestVote           ▲             
+       ▼                             │             
+┌────────────┐    AppendEntries    ┌────────────┐    
+│  Follower  │ ◄───────────────── │  Follower  │    
+│  (node2)   │ ─────────────────► │  (node1)   │    
+└────────────┘    RequestVote      └────────────┘    
+```
+
+Each node maintains:
+
+* A persistent **log** of commands
+* A **state machine** (in-memory KV store)
+* Timers for election/heartbeat
+
+RPCs (`/raft/vote`, `/raft/append`) ensure consensus; a REST API (`/command`, `/status`, `/log`) exposes client operations and monitoring.
+
+---
+
+## 📦 Features
+
+* **Complete Raft**: election, pre-vote, log replication, commit indexing
+* **Fault Injection**: simulate network partitions and node crashes
+* **Real-time Dashboard**: cluster topology, log streams, per-node metrics
+* **RESTful Client API**: `set`, `get`, `delete` operations
+* **Dockerized Deployment**: one-line cluster spin-up
+
+---
+
+## 🧪 Testing
+
+Run end-to-end scenarios (leader election, replication) with pytest:
+
+```bash
+# From project root (requires Docker running)
+pytest -xvs tests/test_end_to_end.py
+```
+
+---
+
+## 🛠️ Development
+
+```
+raft-consensus/
+├── api/          # FastAPI/AioHTTP server
+├── cli/          # Node launcher & configuration
+├── docker/       # Docker Compose setup
+├── frontend/     # Next.js React UI
+└── raft/         # Core Raft implementation
+    ├── config.py
+    ├── log.py
+    ├── node.py
+    ├── rpc.py
+    └── state.py
+```
+
+* **Add a new feature** → implement in `raft/node.py` + expose in API
+* **UI tweaks** → modify React components under `frontend/src/components`
+
+---
+
+## 📖 License
+
+Licensed under **MIT**. See [LICENSE](LICENSE) for details.
+
+---
+
+## 🙏 Acknowledgements
+
+* **Raft paper** by Ongaro & Ousterhout
+* [raft.github.io](https://raft.github.io) for the canonical visualization
+* Community contributions and feedback
+
+---
+
+Feel free to open issues or pull requests—your improvements are welcome!
