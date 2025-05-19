@@ -31,10 +31,11 @@ class RaftNode:
         # Ξεκάθαρη διεύθυνση κόμβου για RPC επικοινωνία
         self.node_address = f"{config.host}:{config.port}"
         
-        # Αναγνώριση peers - σαφέστερο φιλτράρισμα
+        # Αναγνώριση peers - διορθωμένο φιλτράρισμα
         self.peers = []
         for peer in config.cluster_nodes:
-            if peer != self.node_address and peer not in self.peers:
+            # Αποκλείουμε κάθε node αν το node_id μας είναι μέρος του peer string
+            if self.node_id not in peer and peer not in self.peers:
                 self.peers.append(peer)
                 
         logger.info(f"Node {self.node_id} initialized with address {self.node_address}")
@@ -76,31 +77,23 @@ class RaftNode:
         self.min_election_timeout = config.election_timeout_min / 1000.0
         self.leader_stability_timeout = self.min_election_timeout * 3
         
-        # Εξασφάλιση ότι εκκινούμε ως follower
+        # ΚΡΙΣΙΜΗ ΑΛΛΑΓΗ: Ξεκινάμε όλοι ως followers χωρίς αναγνωρισμένο leader
         self.volatile_state.state = NodeState.FOLLOWER
+        self.volatile_state.leader_id = None  # Ξεκάθαρα κανένας leader
         
         # Ενημέρωση cluster state
         self.update_cluster_state()
         
-        # Προκαθορισμένος αρχικός ηγέτης
+        # ΑΠΛΟΠΟΙΗΜΕΝΗ ΛΟΓΙΚΗ: Ο node0 καθυστερεί ΠΟΛΥ λιγότερο από τους άλλους στην εκκίνηση εκλογής
         if self.node_id == "node0":
-            # node0 ξεκινά ως leader μετά από μικρή καθυστέρηση (για να επιτρέψει την αρχικοποίηση των άλλων)
-            asyncio.create_task(self._become_initial_leader())
+            election_delay = 0.5  # Μικρή καθυστέρηση για τον node0
         else:
-            # Οι άλλοι κόμβοι περιμένουν περισσότερο για να αναγνωρίσουν τον αρχικό ηγέτη
+            # Οι άλλοι κόμβοι περιμένουν πολύ περισσότερο
             node_num = int(self.node_id[-1])
-            election_delay = 2.0 + (node_num * 1.0)  # Διαφορετική καθυστέρηση για κάθε κόμβο
-            self.reset_election_timer_with_delay(election_delay)
+            election_delay = 5.0 + (node_num * 2.0)  # Πολύ μεγαλύτερη διαφορά
     
-    async def _become_initial_leader(self):
-        """Make this node the initial leader after a short delay."""
-        # Καθυστέρηση ώστε να αρχικοποιηθούν όλοι οι κόμβοι
-        await asyncio.sleep(1.0)
-        logger.info(f"Node {self.node_id} becoming initial leader")
-        
-        # Αύξηση του term και γίνεται ηγέτης
-        self.persistent_state.current_term += 1
-        self.become_leader()
+        logger.info(f"Node {self.node_id} will start election after {election_delay}s")
+        self.reset_election_timer_with_delay(election_delay)
     
     def reset_election_timer_with_delay(self, delay: float) -> None:
         """Reset the election timeout timer with a specific delay."""
@@ -211,17 +204,6 @@ class RaftNode:
         if self.election_in_progress:
             logger.debug(f"Node {self.node_id} already has an election in progress")
             return
-        
-        # Εισαγωγή καθυστέρησης με βάση το node_id για να αποφύγουμε συγχρονισμένες εκλογές
-        node_num = int(self.node_id[-1])
-        delay = node_num * 0.1  # Κλιμακούμενες καθυστερήσεις ανά κόμβο
-        logger.info(f"Node {self.node_id} waiting {delay}s before starting election")
-        await asyncio.sleep(delay)
-        
-        # Έλεγχος αν στο μεταξύ έχει εκλεγεί ηγέτης
-        if self.volatile_state.leader_id is not None:
-            logger.info(f"Node {self.node_id} cancelling election, leader {self.volatile_state.leader_id} already elected")
-            return
                 
         self.election_in_progress = True
         self.last_election_time = asyncio.get_event_loop().time()
@@ -232,8 +214,11 @@ class RaftNode:
             self.persistent_state.current_term += 1
             new_term = self.persistent_state.current_term
             
-            # Change to candidate state
-            self.become_candidate()
+            # Change to candidate state - ΜΗΝ κάνεις reset timer εδώ!
+            # Χρησιμοποιούμε απευθείας τις εντολές αντί να καλέσουμε become_candidate()
+            logger.info(f"Node {self.node_id} becoming candidate for term {self.persistent_state.current_term}")
+            self.volatile_state.state = NodeState.CANDIDATE
+            self.update_cluster_state()  # Ενημέρωση UI
             
             # Vote for self
             self.persistent_state.record_vote(self.node_id)
@@ -253,17 +238,16 @@ class RaftNode:
             vote_tasks = []
             for peer in self.peers:
                 # Βεβαιωθείτε ότι δεν ζητάμε ψήφο από τον εαυτό μας
-                if peer != self.node_address:
-                    task = asyncio.create_task(
-                        self.rpc.request_vote(
-                            peer,
-                            new_term,
-                            self.node_id,
-                            last_log_index,
-                            last_log_term
-                        )
+                task = asyncio.create_task(
+                    self.rpc.request_vote(
+                        peer,
+                        new_term,
+                        self.node_id,
+                        last_log_index,
+                        last_log_term
                     )
-                    vote_tasks.append(task)
+                )
+                vote_tasks.append(task)
             
             if not vote_tasks:
                 logger.warning(f"No peers available for vote requests")
@@ -717,8 +701,9 @@ class RaftNode:
         # Update state
         self.volatile_state.state = NodeState.CANDIDATE
         
-        # Reset election timer
-        self.reset_election_timer()
+        # ΔΙΟΡΘΩΣΗ: Αφαιρέθηκε ο επαναπροσδιορισμός του election timer
+        # ΔΕΝ κάνουμε reset του timer εδώ, για να μην διακόπτεται η εκλογή
+        # self.reset_election_timer()
         
         # Update cluster state for UI
         self.update_cluster_state()

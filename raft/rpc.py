@@ -32,6 +32,7 @@ class RaftRPC:
         # Register RPC handlers
         self.vote_handler: Optional[Callable] = None
         self.append_entries_handler: Optional[Callable] = None
+        self.prevote_handler: Optional[Callable] = None  # Νέος handler για pre-vote
         
         # Communication tracking
         self.last_communication: Dict[str, float] = {}
@@ -42,6 +43,7 @@ class RaftRPC:
         """Start the RPC server."""
         # Set up routes
         self.app.add_routes([
+            web.post('/raft/prevote', self._handle_prevote_request),  # Νέο route για pre-vote
             web.post('/raft/vote', self._handle_vote_request),
             web.post('/raft/append', self._handle_append_entries),
             web.get('/status', self._handle_status_request),
@@ -98,6 +100,27 @@ class RaftRPC:
         """Register a handler for append entries requests."""
         self.append_entries_handler = handler
     
+    def register_prevote_handler(self, handler: Callable) -> None:
+        """Register a handler for pre-vote requests."""
+        self.prevote_handler = handler
+    
+    async def _handle_prevote_request(self, request: web.Request) -> web.Response:
+        """Handle incoming pre-vote requests."""
+        if not self.prevote_handler:
+            return web.Response(status=501, text="Not implemented")
+        
+        try:
+            data = await request.json()
+            logger.debug(f"Node {self.node_id} received pre-vote request: {data}")
+            
+            result = await self.prevote_handler(data)
+            logger.debug(f"Node {self.node_id} pre-vote response: {result}")
+            
+            return web.json_response(result)
+        except Exception as e:
+            logger.error(f"Error handling pre-vote request: {e}", exc_info=True)
+            return web.Response(status=500, text=str(e))
+    
     async def _handle_vote_request(self, request: web.Request) -> web.Response:
         """Handle incoming vote requests."""
         if not self.vote_handler:
@@ -148,6 +171,85 @@ class RaftRPC:
         self.disable_network = False
         self.communication_failures.clear()
         logger.info("Reconnected to all peers")
+    
+    async def request_prevote(self, node_address: str, term: int, 
+                             candidate_id: str, last_log_index: int, 
+                             last_log_term: int) -> Dict[str, Any]:
+        """Send a PreVote RPC to a node."""
+        # Ειδική μεταχείριση για localhost
+        if "localhost" in node_address:
+            host_part, port = node_address.split(":")
+            container_address = f"raft-node{port[-1]}:{port[-4:]}"
+            logger.info(f"Converting {node_address} to container address {container_address}")
+            node_address = container_address
+            
+        # Check network state
+        if self.disable_network:
+            logger.info(f"Network disabled, pre-vote request to {node_address} failed")
+            return {"term": term, "vote_granted": False}
+            
+        if node_address in self.disconnected_peers:
+            logger.info(f"Peer {node_address} disconnected, pre-vote request failed")
+            return {"term": term, "vote_granted": False}
+        
+        # Format URL properly
+        if not node_address.startswith("http://"):
+            url = f"http://{node_address}/raft/prevote"
+        else:
+            url = f"{node_address}/raft/prevote"
+            
+        logger.info(f"Sending pre-vote request to {url} for term {term}")
+            
+        data = {
+            "term": term,
+            "candidate_id": candidate_id,
+            "last_log_index": last_log_index,
+            "last_log_term": last_log_term,
+        }
+        
+        # Try multiple variants of the hostname
+        hostname_variants = self._get_hostname_variants(node_address)
+        
+        # First try the primary address with retry logic
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                async with self.session.post(url, json=data, timeout=5.0) as resp:
+                    if resp.status == 200:
+                        response_data = await resp.json()
+                        self.last_communication[node_address] = asyncio.get_event_loop().time()
+                        self.communication_failures[node_address] = 0
+                        logger.info(f"Pre-vote response from {node_address}: {response_data}")
+                        return response_data
+                    else:
+                        response_text = await resp.text()
+                        logger.warning(f"Failed pre-vote request to {node_address}: {resp.status} - {response_text}")
+                        
+                        if retry < max_retries - 1:
+                            await asyncio.sleep(0.1 * (retry + 1))  # Backoff
+                            continue
+                        else:
+                            self._record_communication_failure(node_address)
+                            # Try alternative hostnames
+                            return await self._try_alternative_hosts(hostname_variants, node_address, data, "prevote")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout requesting pre-vote from {node_address} (retry {retry+1}/{max_retries})")
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.1 * (retry + 1))  # Backoff
+                    continue
+                else:
+                    return await self._try_alternative_hosts(hostname_variants, node_address, data, "prevote")
+            except Exception as e:
+                logger.error(f"Error requesting pre-vote from {node_address}: {e}")
+                self._record_communication_failure(node_address)
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.1 * (retry + 1))  # Backoff
+                    continue
+                else:
+                    return {"term": term, "vote_granted": False}
+                
+        # If we reach here, all retries failed
+        return {"term": term, "vote_granted": False}
     
     async def request_vote(self, node_address: str, term: int, 
                           candidate_id: str, last_log_index: int, 
