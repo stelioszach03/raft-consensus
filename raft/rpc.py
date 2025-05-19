@@ -21,7 +21,7 @@ class RaftRPC:
         self.app = web.Application()
         self.session = None
         
-        # Προσθήκα για τις προσομοιώσεις
+        # For simulations
         self.disable_network = False
         self.disconnected_peers: Set[str] = set()
         
@@ -29,12 +29,12 @@ class RaftRPC:
         self.vote_handler: Optional[Callable] = None
         self.append_entries_handler: Optional[Callable] = None
         
-        # Αποθήκευση των χρόνων τελευταίας επικοινωνίας με κάθε peer
+        # Store last communication times with each peer
         self.last_communication: Dict[str, float] = {}
         
-        # Αποτυχίες επικοινωνίας
+        # Communication failures
         self.communication_failures: Dict[str, int] = {}
-        self.max_failures = 5  # Μέγιστος αριθμός αποτυχιών πριν θεωρήσουμε τον peer αποσυνδεδεμένο
+        self.max_failures = 5
     
     async def start(self) -> None:
         """Start the RPC server."""
@@ -45,7 +45,7 @@ class RaftRPC:
         ])
         
         # Create client session with longer timeout
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0))
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0))
         
         # Start server
         self.server = await asyncio.get_event_loop().create_server(
@@ -108,15 +108,15 @@ class RaftRPC:
     def reconnect_all_peers(self) -> None:
         """Reconnect to all peers."""
         self.disconnected_peers.clear()
-        self.disable_network = False  # Make sure network is enabled
-        self.communication_failures.clear()  # Reset failure counts
+        self.disable_network = False
+        self.communication_failures.clear()
         logger.info("Reconnected to all peers")
     
     async def request_vote(self, node_address: str, term: int, 
                           candidate_id: str, last_log_index: int, 
                           last_log_term: int) -> Dict[str, Any]:
         """Send a RequestVote RPC to a node."""
-        # Έλεγχος κατάστασης δικτύου για προσομοιώσεις
+        # Check network status for simulations
         if self.disable_network:
             logger.info(f"Network disabled, vote request to {node_address} failed")
             return {"term": term, "vote_granted": False}
@@ -124,8 +124,13 @@ class RaftRPC:
         if node_address in self.disconnected_peers:
             logger.info(f"Peer {node_address} disconnected, vote request failed")
             return {"term": term, "vote_granted": False}
+        
+        # Fix URL formatting
+        if not node_address.startswith('http://'):
+            url = f"http://{node_address}/raft/vote"
+        else:
+            url = f"{node_address}/raft/vote"
             
-        url = f"http://{node_address}/raft/vote"
         data = {
             "term": term,
             "candidate_id": candidate_id,
@@ -134,13 +139,13 @@ class RaftRPC:
         }
         
         try:
-            # Χρήση μεγαλύτερου timeout
-            async with self.session.post(url, json=data, timeout=1.0) as resp:
+            # Use longer timeout
+            async with self.session.post(url, json=data, timeout=3.0) as resp:
                 if resp.status == 200:
                     response_data = await resp.json()
-                    # Ενημέρωση του χρόνου τελευταίας επικοινωνίας
+                    # Update last communication time
                     self.last_communication[node_address] = asyncio.get_event_loop().time()
-                    # Μηδενισμός μετρητή αποτυχιών
+                    # Reset failure counter
                     self.communication_failures[node_address] = 0
                     return response_data
                 else:
@@ -161,7 +166,7 @@ class RaftRPC:
                             prev_log_term: int, entries: List[Dict[str, Any]],
                             leader_commit: int) -> Dict[str, Any]:
         """Send an AppendEntries RPC to a node."""
-        # Έλεγχος κατάστασης δικτύου για προσομοιώσεις
+        # Check network status for simulations
         if self.disable_network:
             logger.info(f"Network disabled, append entries to {node_address} failed")
             return {"term": term, "success": False}
@@ -169,8 +174,13 @@ class RaftRPC:
         if node_address in self.disconnected_peers:
             logger.info(f"Peer {node_address} disconnected, append entries failed")
             return {"term": term, "success": False}
+        
+        # Fix URL formatting
+        if not node_address.startswith('http://'):
+            url = f"http://{node_address}/raft/append"
+        else:
+            url = f"{node_address}/raft/append"
             
-        url = f"http://{node_address}/raft/append"
         data = {
             "term": term,
             "leader_id": leader_id,
@@ -181,13 +191,13 @@ class RaftRPC:
         }
         
         try:
-            # Χρήση μεγαλύτερου timeout
-            async with self.session.post(url, json=data, timeout=1.0) as resp:
+            # Use longer timeout
+            async with self.session.post(url, json=data, timeout=3.0) as resp:
                 if resp.status == 200:
                     response_data = await resp.json()
-                    # Ενημέρωση του χρόνου τελευταίας επικοινωνίας
+                    # Update last communication time
                     self.last_communication[node_address] = asyncio.get_event_loop().time()
-                    # Μηδενισμός μετρητή αποτυχιών
+                    # Reset failure counter
                     self.communication_failures[node_address] = 0
                     return response_data
                 else:

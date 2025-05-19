@@ -1,10 +1,10 @@
-# Δημιουργία του αρχείου docker/docker-compose.yml
 services:
   node0:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node0
+    hostname: node0
     command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8000", "--debug"]
     ports:
       - "7100:7000"
@@ -12,7 +12,9 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      - raft_network
+      raft_network:
+        aliases:
+          - node0
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
@@ -22,6 +24,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node1
+    hostname: node1
     command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8001", "--debug"]
     ports:
       - "7101:7001"
@@ -29,19 +32,19 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      - raft_network
+      raft_network:
+        aliases:
+          - node1
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    depends_on:
-      node0:
-        condition: service_started
 
   node2:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node2
+    hostname: node2
     command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8002", "--debug"]
     ports:
       - "7102:7002"
@@ -49,13 +52,12 @@ services:
     volumes:
       - raft_data:/app/data
     networks:
-      - raft_network
+      raft_network:
+        aliases:
+          - node2
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    depends_on:
-      node1:
-        condition: service_started
 
 networks:
   raft_network:
