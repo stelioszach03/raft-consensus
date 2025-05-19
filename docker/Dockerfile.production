@@ -6,6 +6,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
     git \
+    iputils-ping \
+    net-tools \
+    dnsutils \
+    iproute2 \
+    procps \
     && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \
@@ -38,6 +43,9 @@ COPY pyproject.toml ./
 
 # Expose ports
 EXPOSE 7000-7002 8000-8002
+
+# Ρύθμιση του Python για άμεση έξοδο των logs
+ENV PYTHONUNBUFFERED=1
 
 # Ορισμός entrypoint
 ENTRYPOINT ["python"]

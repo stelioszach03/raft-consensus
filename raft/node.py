@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import random
+import os
 from typing import Dict, List, Any, Optional, Set, Tuple
 
 from raft.config import RaftConfig
@@ -25,7 +26,11 @@ class RaftNode:
     def __init__(self, config: RaftConfig):
         self.config = config
         self.node_id = config.node_id
-        self.peers = [node for node in config.cluster_nodes if node != self.node_id]
+        # Διόρθωση: Σωστός τρόπος φιλτραρίσματος peers, αφαιρώντας τον εαυτό μας
+        self.node_address = f"{config.host}:{config.port}"
+        self.peers = [node for node in config.cluster_nodes if node != self.node_address]
+        logger.info(f"Node {self.node_id} initialized with address {self.node_address}")
+        logger.info(f"Node {self.node_id} initialized with peers: {self.peers}")
         
         # Initialize state
         self.persistent_state = PersistentState(config.state_path)
@@ -54,18 +59,18 @@ class RaftNode:
         self.cluster_state = ClusterState(self.node_id, config)
         self.update_cluster_state()
         
-        # Protection against simultaneous elections
+        # Προστασία από ταυτόχρονες εκλογές
         self.election_in_progress = False
         self.last_election_time = 0.0
         
-        # Mechanism to avoid consecutive elections from the same node
+        # Μηχανισμός για αποφυγή διαδοχικών εκλογών από τον ίδιο κόμβο
         self.consecutive_elections = 0
-        self.max_consecutive_elections = 5
+        self.max_consecutive_elections = 3
         
-        # Time of last successful election
+        # Χρόνος τελευταίας επιτυχούς εκλογής
         self.last_successful_election_time = 0.0
         
-        # Election stability
+        # Σταθερότητα εκλογών
         self.election_stability_factor = 1.0
     
     async def start(self) -> None:
@@ -110,10 +115,10 @@ class RaftNode:
         if self.election_timer:
             self.election_timer.cancel()
         
-        # Use the fixed random timeout that depends on the node_id
+        # Χρήση του σταθερού τυχαίου timeout που εξαρτάται από το node_id
         timeout = self.config.random_election_timeout
         
-        # Log for diagnostic purposes
+        # Καταγραφή για διαγνωστικούς σκοπούς
         logger.debug(f"Node {self.node_id} setting election timeout: {timeout:.2f}s")
         
         self.election_timer = asyncio.create_task(self.election_timeout(timeout))
@@ -124,13 +129,11 @@ class RaftNode:
         When this timeout triggers, the node becomes a candidate and starts an election.
         """
         try:
-            # Add a small jitter to avoid simultaneous timeouts
-            jitter = random.uniform(0, 0.1 * timeout)
-            await asyncio.sleep(timeout + jitter)
+            await asyncio.sleep(timeout)
             
-            # Protection against too frequent elections
+            # Προστασία από πολύ συχνές εκλογές
             current_time = asyncio.get_event_loop().time()
-            if current_time - self.last_election_time < 2.0:
+            if current_time - self.last_election_time < 1.0:
                 logger.debug(f"Node {self.node_id} skipping election, too soon after last one")
                 self.reset_election_timer()
                 return
@@ -142,8 +145,8 @@ class RaftNode:
                 
             if self.consecutive_elections >= self.max_consecutive_elections:
                 logger.debug(f"Node {self.node_id} has initiated too many consecutive elections, backing off")
-                # Increased delay when reaching consecutive elections limit
-                await asyncio.sleep(random.uniform(3.0, 6.0))
+                # Αυξημένη καθυστέρηση όταν φτάνουμε το όριο διαδοχικών εκλογών
+                await asyncio.sleep(random.uniform(1.0, 2.0))
                 self.consecutive_elections = 0
                 self.reset_election_timer()
                 return
@@ -157,13 +160,17 @@ class RaftNode:
     
     async def start_election(self) -> None:
         """Start a leader election."""
-        # Mark that an election is in progress
+        # Σημειώνουμε ότι μια εκλογή είναι σε εξέλιξη
+        if self.election_in_progress:
+            logger.debug(f"Node {self.node_id} already has an election in progress")
+            return
+            
         self.election_in_progress = True
         self.last_election_time = asyncio.get_event_loop().time()
         self.consecutive_elections += 1
         
         try:
-            # Calculate stability factor - increases with each consecutive election
+            # Υπολογισμός του stability factor - αυξάνεται με κάθε διαδοχική εκλογή
             self.election_stability_factor = min(1.0 + (self.consecutive_elections * 0.2), 3.0)
             
             # Increment current term
@@ -183,57 +190,70 @@ class RaftNode:
             votes_received = 1  # Vote for self
             votes_needed = (len(self.peers) + 1) // 2 + 1
             
+            # Περισσότερες πληροφορίες για το debugging
+            logger.info(f"Node {self.node_id} starting election for term {new_term}, need {votes_needed} votes")
+            logger.info(f"Peers to contact: {self.peers}")
+            
             # Request votes from all peers
             vote_tasks = []
             for peer in self.peers:
-                peer_address = peer
-                task = asyncio.create_task(
-                    self.rpc.request_vote(
-                        peer_address,
-                        new_term,
-                        self.node_id,
-                        last_log_index,
-                        last_log_term
+                # Διόρθωση: Βεβαιωθείτε ότι δεν ζητάμε ψήφο από τον εαυτό μας
+                if peer != self.node_address:
+                    task = asyncio.create_task(
+                        self.rpc.request_vote(
+                            peer,
+                            new_term,
+                            self.node_id,
+                            last_log_index,
+                            last_log_term
+                        )
                     )
-                )
-                vote_tasks.append(task)
+                    vote_tasks.append(task)
             
-            # Wait for votes - use gather with return_exceptions=True to avoid errors
-            responses = await asyncio.gather(*vote_tasks, return_exceptions=True)
-            
-            # Process responses
-            for response in responses:
-                if isinstance(response, Exception):
-                    logger.warning(f"Error during vote request: {response}")
-                    continue
+            # Wait for votes with timeout
+            try:
+                if len(vote_tasks) > 0:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
+                    responses = await asyncio.wait_for(asyncio.gather(*vote_tasks, return_exceptions=True), timeout=3.0)
                     
-                if response.get("vote_granted", False):
-                    votes_received += 1
-                    logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
+                    # Process responses με βελτιωμένη καταγραφή
+                    for i, response in enumerate(responses):
+                        peer = self.peers[i] if i < len(self.peers) else "unknown"
+                        if isinstance(response, Exception):
+                            logger.warning(f"Error during vote request to {peer}: {response}")
+                            continue
+                            
+                        logger.info(f"Vote response from {peer}: {response}")
+                        if response.get("vote_granted", False):
+                            votes_received += 1
+                            logger.info(f"Node {self.node_id} received vote from {peer} - now has {votes_received}/{votes_needed}")
+                        
+                        # If we got a higher term, revert to follower
+                        if response.get("term", 0) > self.persistent_state.current_term:
+                            logger.info(f"Node {self.node_id} discovered higher term during election")
+                            self.become_follower(response["term"])
+                            return
+                        
+                        # If we have enough votes, become leader
+                        if votes_received >= votes_needed:
+                            logger.info(f"Node {self.node_id} won election with {votes_received} votes")
+                            # Καταγραφή επιτυχούς εκλογής
+                            self.last_successful_election_time = asyncio.get_event_loop().time()
+                            self.consecutive_elections = 0  # Επαναφορά μετρητή
+                            self.become_leader()
+                            return
+            except asyncio.TimeoutError:
+                logger.warning(f"Election timed out for node {self.node_id}")
                 
-                # If we got a higher term, revert to follower
-                if response.get("term", 0) > self.persistent_state.current_term:
-                    logger.info(f"Node {self.node_id} discovered higher term during election")
-                    self.become_follower(response["term"])
-                    return
-                
-                # If we have enough votes, become leader
-                if votes_received >= votes_needed:
-                    logger.info(f"Node {self.node_id} won election with {votes_received} votes")
-                    # Record successful election
-                    self.last_successful_election_time = asyncio.get_event_loop().time()
-                    self.consecutive_elections = 0  # Reset counter
-                    self.become_leader()
-                    return
-            
             # If we get here, we didn't win the election
-            logger.info(f"Node {self.node_id} lost election, returning to follower state")
-            # Add random delay after failed election
-            # Delay increases based on stability factor
-            await asyncio.sleep(random.uniform(1.0, 3.0) * self.election_stability_factor)
+            logger.info(f"Node {self.node_id} lost election with {votes_received}/{votes_needed} votes, returning to follower state")
+            # Προσθήκα τυχαίας καθυστέρησης μετά από αποτυχημένη εκλογή
+            # Η καθυστέρηση αυξάνεται με βάση το stability factor
+            delay = random.uniform(1.0, 3.0) * self.election_stability_factor
+            logger.debug(f"Node {self.node_id} waiting for {delay:.2f}s before next election attempt")
+            await asyncio.sleep(delay)
             self.become_follower(self.persistent_state.current_term)
         finally:
-            # Mark that the election is complete
+            # Σημειώνουμε ότι η εκλογή ολοκληρώθηκε
             self.election_in_progress = False
     
     async def send_heartbeats(self) -> None:
@@ -248,50 +268,53 @@ class RaftNode:
                 # Log for debugging
                 logger.debug(f"Leader {self.node_id} sending heartbeats to {len(self.peers)} peers")
                 
-                # Send heartbeats to all peers - use gather for parallel sending
+                # Send heartbeats to all peers - χρήση gather για παράλληλη αποστολή
                 heartbeat_tasks = []
                 for peer in self.peers:
-                    peer_address = peer
-                    prev_log_index = self.leader_state.next_index[peer] - 1
-                    prev_log_term = 0
-                    
-                    if prev_log_index > 0:
-                        entry = self.log.get_entry(prev_log_index)
-                        if entry:
-                            prev_log_term = entry.term
-                    
-                    task = asyncio.create_task(
-                        self.rpc.append_entries(
-                            peer_address,
-                            self.persistent_state.current_term,
-                            self.node_id,
-                            prev_log_index,
-                            prev_log_term,
-                            [],  # Empty entries for heartbeat
-                            self.volatile_state.commit_index
+                    # Διόρθωση: Βεβαιωθείτε ότι δεν στέλνουμε heartbeat στον εαυτό μας
+                    if peer != self.node_address:
+                        prev_log_index = self.leader_state.next_index[peer] - 1 if self.leader_state else 0
+                        prev_log_term = 0
+                        
+                        if prev_log_index > 0:
+                            entry = self.log.get_entry(prev_log_index)
+                            if entry:
+                                prev_log_term = entry.term
+                        
+                        task = asyncio.create_task(
+                            self.rpc.append_entries(
+                                peer,
+                                self.persistent_state.current_term,
+                                self.node_id,
+                                prev_log_index,
+                                prev_log_term,
+                                [],  # Empty entries for heartbeat
+                                self.volatile_state.commit_index
+                            )
                         )
-                    )
-                    heartbeat_tasks.append(task)
+                        heartbeat_tasks.append(task)
                 
-                # Wait for responses - use gather with return_exceptions to avoid errors
-                responses = await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
-                
-                # Process responses
-                for i, response in enumerate(responses):
-                    if isinstance(response, Exception):
-                        logger.warning(f"Error sending heartbeat: {response}")
-                        continue
+                # Wait for responses - use gather με return_exceptions για αποφυγή σφαλμάτων
+                if heartbeat_tasks:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
+                    responses = await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
                     
-                    # If we got a higher term, revert to follower
-                    if response.get("term", 0) > self.persistent_state.current_term:
-                        logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
-                        self.become_follower(response["term"])
-                        return
-                    
-                    # If successful, check for pending entries to replicate
-                    peer = self.peers[i]
-                    if response.get("success", False) and self.needs_replication(peer):
-                        asyncio.create_task(self.replicate_log(peer))
+                    # Process responses
+                    for i, response in enumerate(responses):
+                        if isinstance(response, Exception):
+                            logger.warning(f"Error sending heartbeat: {response}")
+                            continue
+                        
+                        # If we got a higher term, revert to follower
+                        if response.get("term", 0) > self.persistent_state.current_term:
+                            logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
+                            self.become_follower(response["term"])
+                            return
+                        
+                        # If successful, check for pending entries to replicate
+                        if i < len(self.peers):  # Πρόσθετος έλεγχος
+                            peer = self.peers[i]
+                            if response.get("success", False) and self.needs_replication(peer):
+                                asyncio.create_task(self.replicate_log(peer))
                 
                 # Update cluster state for UI
                 self.update_cluster_state()
@@ -301,7 +324,7 @@ class RaftNode:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error sending heartbeats: {e}")
+                logger.error(f"Error sending heartbeats: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
     
     def needs_replication(self, peer: str) -> bool:
@@ -317,7 +340,10 @@ class RaftNode:
             logger.warning(f"Cannot replicate logs - no leader state")
             return
             
-        peer_address = peer
+        # Διόρθωση: Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
+        if peer == self.node_address:
+            return
+            
         next_index = self.leader_state.next_index[peer]
         
         # Get the entries to send
@@ -341,7 +367,7 @@ class RaftNode:
         try:
             # Send append entries RPC
             response = await self.rpc.append_entries(
-                peer_address,
+                peer,
                 self.persistent_state.current_term,
                 self.node_id,
                 prev_log_index,
@@ -369,10 +395,11 @@ class RaftNode:
                 # If failed, decrement nextIndex and try again
                 if self.leader_state and self.leader_state.next_index[peer] > 1:
                     self.leader_state.next_index[peer] -= 1
+                    logger.debug(f"Log consistency failed for {peer}, decreasing nextIndex to {self.leader_state.next_index[peer]}")
                     # Try again immediately
                     await self.replicate_log(peer)
         except Exception as e:
-            logger.error(f"Error replicating log to {peer}: {e}")
+            logger.error(f"Error replicating log to {peer}: {e}", exc_info=True)
     
     def update_commit_index(self) -> None:
         """
@@ -590,24 +617,24 @@ class RaftNode:
         If leader, append to log and replicate.
         If follower, redirect to leader.
         """
-        # Add retry logic
-        max_retries = 3
-        retry_delay = 0.5
+        # Προσθήκη retry λογικής
+        max_retries = 5  # Αυξήθηκε από 3
+        retry_delay = 0.3  # Μειώθηκε από 0.5
         
         for attempt in range(max_retries):
             if self.volatile_state.state != NodeState.LEADER:
                 # Redirect to leader if known
                 if self.volatile_state.leader_id:
                     logger.info(f"Redirecting client request to leader {self.volatile_state.leader_id}")
-                    # Here we could have forwarding code, but for simplicity
-                    # we just return the leader info
+                    # Εδώ θα μπορούσαμε να έχουμε κώδικα προώθησης, αλλά για απλότητα
+                    # απλά επιστρέφουμε την πληροφορία του ηγέτη
                     return {
                         "success": False,
                         "leader": self.volatile_state.leader_id,
                         "message": "Please retry with the leader node"
                     }
                 else:
-                    # If there's no known leader, wait a bit and try again
+                    # Αν δεν υπάρχει γνωστός ηγέτης, περιμένουμε λίγο και ξαναπροσπαθούμε
                     if attempt < max_retries - 1:
                         logger.debug(f"No known leader, retrying ({attempt+1}/{max_retries})")
                         await asyncio.sleep(retry_delay)
@@ -618,7 +645,7 @@ class RaftNode:
                         "retry": True
                     }
             
-            # If we get here, we're the leader
+            # Αν φτάσαμε εδώ, είμαστε ο ηγέτης
             logger.info(f"Leader {self.node_id} handling client request: {command}")
             
             try:
@@ -628,11 +655,14 @@ class RaftNode:
                 # Replicate to followers
                 replication_tasks = []
                 for peer in self.peers:
-                    task = asyncio.create_task(self.replicate_log(peer))
-                    replication_tasks.append(task)
+                    # Διόρθωση: Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
+                    if peer != self.node_address:
+                        task = asyncio.create_task(self.replicate_log(peer))
+                        replication_tasks.append(task)
                 
                 # Wait for replication with timeout
-                await asyncio.wait(replication_tasks, timeout=2.0)
+                if replication_tasks:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
+                    await asyncio.wait(replication_tasks, timeout=3.0)  # Αυξήθηκε από 2.0
                 
                 # Wait for command to be applied
                 max_wait = 5.0  # seconds
@@ -665,7 +695,7 @@ class RaftNode:
                         "retry": True
                     }
             except Exception as e:
-                logger.error(f"Error handling client request: {e}")
+                logger.error(f"Error handling client request: {e}", exc_info=True)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     continue
@@ -675,7 +705,7 @@ class RaftNode:
                     "retry": True
                 }
         
-        # If we get here, all retries have failed
+        # Αν φτάσαμε εδώ, έχουν αποτύχει όλες οι προσπάθειες
         return {
             "success": False,
             "error": "All retries failed",
@@ -701,14 +731,14 @@ class RaftNode:
         # Reset leader state
         self.leader_state = None
         
-        # Reset consecutive elections counter when becoming follower
-        # only if enough time has passed
+        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε follower
+        # μόνο αν έχει περάσει αρκετός χρόνος
         current_time = asyncio.get_event_loop().time()
-        if current_time - self.last_election_time > 5.0:
+        if current_time - self.last_election_time > 3.0:  # Μειωμένο από 5.0
             self.consecutive_elections = 0
         
-        # Reset election timer with longer timeout when becoming follower
-        # to give the system time to stabilize
+        # Reset election timer με μεγαλύτερο timeout όταν γίνεται follower
+        # για να δώσει χρόνο στο σύστημα να σταθεροποιηθεί
         if self.election_timer:
             self.election_timer.cancel()
 
@@ -757,7 +787,7 @@ class RaftNode:
         # Append a no-op entry to commit any previous entries
         self.log.append(self.persistent_state.current_term, {"operation": "no-op"})
         
-        # Reset consecutive elections counter when becoming leader
+        # Μηδενισμός των διαδοχικών εκλογών όταν γίνουμε leader
         self.consecutive_elections = 0
         
         # Start sending heartbeats

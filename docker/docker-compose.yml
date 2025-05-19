@@ -1,10 +1,10 @@
+# Δημιουργία του αρχείου docker/docker-compose.yml
 services:
   node0:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node0
-    hostname: node0
     command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8000", "--debug"]
     ports:
       - "7100:7000"
@@ -18,13 +18,19 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+    # Προσθήκη healthcheck
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   node1:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node1
-    hostname: node1
     command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8001", "--debug"]
     ports:
       - "7101:7001"
@@ -38,13 +44,21 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+    depends_on:
+      node0:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7001/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   node2:
     build:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node2
-    hostname: node2
     command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8002", "--debug"]
     ports:
       - "7102:7002"
@@ -58,6 +72,15 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+    depends_on:
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
 networks:
   raft_network:
