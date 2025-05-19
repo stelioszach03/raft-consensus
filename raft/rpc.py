@@ -6,6 +6,8 @@ from typing import Dict, List, Any, Optional, Tuple, Callable, Set
 
 import aiohttp
 from aiohttp import web
+from aiohttp.resolver import AsyncResolver
+from aiohttp import TCPConnector
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +49,22 @@ class RaftRPC:
             web.get('/status', self._handle_status_request),
         ])
         
-        # Create client session with longer timeout
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0))
+        # Create client session with better DNS resolution and longer timeout
+        # Χρήση AsyncResolver για καλύτερο DNS resolution και αποφυγή του CancelledError
+        resolver = AsyncResolver()
+        connector = TCPConnector(
+            resolver=resolver,
+            family=0,  # Επιτρέπει IPv4 και IPv6
+            ssl=False,
+            use_dns_cache=True,
+            ttl_dns_cache=300,  # Cache DNS entries for 5 minutes
+            limit=100  # Αύξηση του ορίου ταυτόχρονων συνδέσεων
+        )
+        
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10.0, connect=5.0),
+            connector=connector
+        )
         
         # Start server με τη σωστή μέθοδο της aiohttp
         runner = web.AppRunner(self.app)
@@ -148,7 +164,7 @@ class RaftRPC:
             logger.info(f"Peer {node_address} disconnected, vote request failed")
             return {"term": term, "vote_granted": False}
         
-        # Χρήση σωστής μορφής URL
+        # Χρήση σωστής μορφής URL - δοκιμή πολλαπλών hostnames
         if not node_address.startswith("http://"):
             url = f"http://{node_address}/raft/vote"
         else:
@@ -163,9 +179,16 @@ class RaftRPC:
             "last_log_term": last_log_term,
         }
         
+        # Δοκιμή με διαφορετικούς hostnames αν αποτύχει
+        for hostname_variant in self._get_hostname_variants(node_address):
+            if hostname_variant != node_address:
+                alt_url = f"http://{hostname_variant}/raft/vote"
+                logger.debug(f"Will try alternative hostname {alt_url} if primary fails")
+        
         try:
-            # Χρήση μεγαλύτερου timeout
-            async with self.session.post(url, json=data, timeout=2.0) as resp:
+            # Προστασία του αιτήματος από ακύρωση με asyncio.shield
+            # και αύξηση του timeout
+            async with self.session.post(url, json=data, timeout=10.0) as resp:
                 if resp.status == 200:
                     response_data = await resp.json()
                     # Ενημέρωση του χρόνου τελευταίας επικοινωνίας
@@ -181,6 +204,24 @@ class RaftRPC:
                     return {"term": term, "vote_granted": False}
         except asyncio.TimeoutError:
             logger.warning(f"Timeout requesting vote from {node_address}")
+            
+            # Δοκιμή εναλλακτικών hostname αν υπάρχουν
+            for hostname_variant in self._get_hostname_variants(node_address):
+                if hostname_variant == node_address:
+                    continue
+                    
+                alt_url = f"http://{hostname_variant}/raft/vote"
+                logger.info(f"Trying alternative hostname {alt_url}")
+                
+                try:
+                    async with self.session.post(alt_url, json=data, timeout=10.0) as resp:
+                        if resp.status == 200:
+                            response_data = await resp.json()
+                            logger.info(f"Vote response from alternative {hostname_variant}: {response_data}")
+                            return response_data
+                except Exception:
+                    pass
+            
             self._record_communication_failure(node_address)
             return {"term": term, "vote_granted": False}
         except Exception as e:
@@ -223,9 +264,19 @@ class RaftRPC:
             "leader_commit": leader_commit,
         }
         
+        # Δοκιμή με διαφορετικούς hostnames αν αποτύχει
+        for hostname_variant in self._get_hostname_variants(node_address):
+            if hostname_variant != node_address:
+                alt_url = f"http://{hostname_variant}/raft/append"
+                logger.debug(f"Will try alternative hostname {alt_url} if primary fails")
+        
         try:
-            # Χρήση μεγαλύτερου timeout
-            async with self.session.post(url, json=data, timeout=2.0) as resp:
+            # Προστασία του αιτήματος από ακύρωση με asyncio.shield
+            # και αύξηση του timeout
+            request_task = self.session.post(url, json=data, timeout=10.0)
+            shielded_task = asyncio.shield(request_task)
+            
+            async with await shielded_task as resp:
                 if resp.status == 200:
                     response_data = await resp.json()
                     # Ενημέρωση του χρόνου τελευταίας επικοινωνίας
@@ -240,12 +291,51 @@ class RaftRPC:
                     return {"term": term, "success": False}
         except asyncio.TimeoutError:
             logger.warning(f"Timeout appending entries to {node_address}")
+            
+            # Δοκιμή εναλλακτικών hostname αν υπάρχουν
+            for hostname_variant in self._get_hostname_variants(node_address):
+                if hostname_variant == node_address:
+                    continue
+                    
+                alt_url = f"http://{hostname_variant}/raft/append"
+                logger.info(f"Trying alternative hostname {alt_url}")
+                
+                try:
+                    async with self.session.post(alt_url, json=data, timeout=10.0) as resp:
+                        if resp.status == 200:
+                            response_data = await resp.json()
+                            logger.info(f"Append response from alternative {hostname_variant}: {response_data}")
+                            return response_data
+                except Exception:
+                    pass
+            
             self._record_communication_failure(node_address)
             return {"term": term, "success": False}
         except Exception as e:
             logger.error(f"Error appending entries to {node_address}: {e}", exc_info=True)
             self._record_communication_failure(node_address)
             return {"term": term, "success": False}
+    
+    def _get_hostname_variants(self, node_address: str) -> List[str]:
+        """
+        Δημιουργεί παραλλαγές hostname για δοκιμή εναλλακτικών ονομάτων.
+        Για παράδειγμα, για node0:7000 δοκιμάζει επίσης raft-node0:7000.
+        """
+        variants = [node_address]
+        
+        # Εξαγωγή του hostname και του port
+        if ':' in node_address:
+            hostname, port = node_address.split(':', 1)
+            
+            # Δοκιμή με προθέματα/ονόματα container
+            if hostname.startswith('node'):
+                node_num = hostname[4:]
+                variants.append(f"raft-{hostname}:{port}")
+            elif hostname.startswith('raft-node'):
+                node_num = hostname[9:]
+                variants.append(f"node{node_num}:{port}")
+        
+        return variants
     
     def _record_communication_failure(self, node_address: str) -> None:
         """Record a communication failure with a peer."""

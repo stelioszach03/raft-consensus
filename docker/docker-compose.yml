@@ -5,7 +5,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node0
-    command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8000", "--debug"]
+    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
+    command: ["-m", "cli.main", "--id", "node0", "--host", "0.0.0.0", "--port", "7000", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8000", "--debug"]
     ports:
       - "7100:7000"
       - "8100:8000"
@@ -14,11 +15,13 @@ services:
     networks:
       raft_network:
         aliases:
-          - node0
+          # Προσθήκη και των δύο ονομάτων ως aliases
+          - node0 
+          - raft-node0
+    hostname: raft-node0
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    # Προσθήκη healthcheck
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7000/status"]
       interval: 10s
@@ -31,7 +34,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node1
-    command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8001", "--debug"]
+    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
+    command: ["-m", "cli.main", "--id", "node1", "--host", "0.0.0.0", "--port", "7001", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8001", "--debug"]
     ports:
       - "7101:7001"
       - "8101:8001"
@@ -40,7 +44,10 @@ services:
     networks:
       raft_network:
         aliases:
+          # Προσθήκη και των δύο ονομάτων ως aliases
           - node1
+          - raft-node1
+    hostname: raft-node1
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
@@ -59,7 +66,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.production
     container_name: raft-node2
-    command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "node0:7000,node1:7001,node2:7002", "--api-port", "8002", "--debug"]
+    # Διόρθωση: χρήση container_name αντί για node_id στο --cluster
+    command: ["-m", "cli.main", "--id", "node2", "--host", "0.0.0.0", "--port", "7002", "--cluster", "raft-node0:7000,raft-node1:7001,raft-node2:7002", "--api-port", "8002", "--debug"]
     ports:
       - "7102:7002"
       - "8102:8002"
@@ -68,7 +76,10 @@ services:
     networks:
       raft_network:
         aliases:
+          # Προσθήκη και των δύο ονομάτων ως aliases
           - node2
+          - raft-node2
+    hostname: raft-node2
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped

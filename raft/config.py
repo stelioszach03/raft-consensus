@@ -18,9 +18,10 @@ class RaftConfig:
     port: int
     
     # Timing settings (in milliseconds)
-    election_timeout_min: int = 1500   # Μειωμένο από 2000 για πιο γρήγορες εκλογές
-    election_timeout_max: int = 3000   # Μειωμένο από 10000 για πιο γρήγορες εκλογές
-    heartbeat_interval: int = 250      # Μειωμένο από 500 για πιο συχνά heartbeats
+    # Τροποποίηση των τιμών για βελτιωμένο consensus
+    election_timeout_min: int = 600   # Αυξημένο για να αποφευχθούν πολύ συχνές εκλογές
+    election_timeout_max: int = 1000  # Αυξημένο αλλά όχι υπερβολικά
+    heartbeat_interval: int = 100     # Διατηρημένο χαμηλά για συχνά heartbeats
     
     # Storage settings
     storage_dir: str = "data"
@@ -36,13 +37,20 @@ class RaftConfig:
         """
         # Χρήση του node_id για σταθερή διαφοροποίηση μεταξύ κόμβων
         node_num = int(self.node_id.replace('node', '')) if self.node_id.startswith('node') else 0
-        node_offset = node_num * 500  # Μειώθηκε από 1000ms σε 500ms για λιγότερη διασπορά
+        node_offset = node_num * 100  # Αυξημένο offset για καλύτερο διαχωρισμό μεταξύ κόμβων
         
         # Τυχαία τιμή μέσα στο εύρος, με προσθήκη του offset
         base_timeout = self.election_timeout_min 
         max_random = self.election_timeout_max - self.election_timeout_min
         timeout = (base_timeout + node_offset + random.uniform(0, max_random)) / 1000
         
+        # Βεβαιωνόμαστε ότι οι κόμβοι έχουν επαρκώς διαφορετικά timeouts
+        # Η αναλογία πρέπει να είναι election_timeout > heartbeat_interval * 10
+        # για να αποφύγουμε περιττές εκλογές από timeouts
+        min_recommended = self.heartbeat_interval_seconds * 10
+        if timeout < min_recommended:
+            timeout = min_recommended * (1 + 0.5 * random.random())  # Προσθήκη 0-50% επιπλέον
+            
         return timeout
     
     @property

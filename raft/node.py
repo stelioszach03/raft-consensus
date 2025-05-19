@@ -164,7 +164,7 @@ class RaftNode:
         if self.election_in_progress:
             logger.debug(f"Node {self.node_id} already has an election in progress")
             return
-            
+                
         self.election_in_progress = True
         self.last_election_time = asyncio.get_event_loop().time()
         self.consecutive_elections += 1
@@ -210,27 +210,32 @@ class RaftNode:
                     )
                     vote_tasks.append(task)
             
-            # Wait for votes with timeout
-            try:
-                if len(vote_tasks) > 0:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
-                    responses = await asyncio.wait_for(asyncio.gather(*vote_tasks, return_exceptions=True), timeout=3.0)
-                    
-                    # Process responses με βελτιωμένη καταγραφή
-                    for i, response in enumerate(responses):
-                        peer = self.peers[i] if i < len(self.peers) else "unknown"
-                        if isinstance(response, Exception):
-                            logger.warning(f"Error during vote request to {peer}: {response}")
-                            continue
-                            
-                        logger.info(f"Vote response from {peer}: {response}")
+            # Περιμένουμε απαντήσεις με timeout αλλά χωρίς να ακυρώνουμε tasks
+            if vote_tasks:
+                # Χρήση FIRST_COMPLETED αντί για wait_for για να αποφύγουμε την ακύρωση των tasks
+                # και αύξηση του timeout
+                done, pending = await asyncio.wait(
+                    vote_tasks,
+                    timeout=5.0,  # Αύξηση του timeout από 3.0 σε 5.0
+                    return_when=asyncio.FIRST_COMPLETED  # Επιστροφή μόλις ολοκληρωθεί οποιοδήποτε task
+                )
+                
+                # Επεξεργασία των ολοκληρωμένων tasks
+                for task in done:
+                    try:
+                        response = task.result()
                         if response.get("vote_granted", False):
                             votes_received += 1
-                            logger.info(f"Node {self.node_id} received vote from {peer} - now has {votes_received}/{votes_needed}")
+                            logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
                         
                         # If we got a higher term, revert to follower
                         if response.get("term", 0) > self.persistent_state.current_term:
                             logger.info(f"Node {self.node_id} discovered higher term during election")
                             self.become_follower(response["term"])
+                            
+                            # Ακύρωση των υπόλοιπων pending tasks
+                            for t in pending:
+                                t.cancel()
                             return
                         
                         # If we have enough votes, become leader
@@ -239,11 +244,60 @@ class RaftNode:
                             # Καταγραφή επιτυχούς εκλογής
                             self.last_successful_election_time = asyncio.get_event_loop().time()
                             self.consecutive_elections = 0  # Επαναφορά μετρητή
+                            
+                            # Ακύρωση των υπόλοιπων pending tasks
+                            for t in pending:
+                                t.cancel()
+                                
                             self.become_leader()
                             return
-            except asyncio.TimeoutError:
-                logger.warning(f"Election timed out for node {self.node_id}")
+                    except Exception as e:
+                        logger.warning(f"Error processing vote response: {e}")
                 
+                # Συνέχιση με τα εκκρεμή tasks
+                if pending:
+                    # Χρήση μεγαλύτερου timeout για τα υπόλοιπα tasks
+                    done2, pending2 = await asyncio.wait(
+                        pending, 
+                        timeout=10.0  # Δίνουμε περισσότερο χρόνο για τα εναπομείναντα
+                    )
+                    
+                    # Επεξεργασία των υπόλοιπων ολοκληρωμένων tasks
+                    for task in done2:
+                        try:
+                            response = task.result()
+                            if response.get("vote_granted", False):
+                                votes_received += 1
+                                logger.info(f"Node {self.node_id} received vote - now has {votes_received}/{votes_needed}")
+                            
+                            # Check term and vote count again
+                            if response.get("term", 0) > self.persistent_state.current_term:
+                                logger.info(f"Node {self.node_id} discovered higher term during election (second phase)")
+                                self.become_follower(response["term"])
+                                
+                                # Ακύρωση των υπόλοιπων pending tasks
+                                for t in pending2:
+                                    t.cancel()
+                                return
+                            
+                            if votes_received >= votes_needed:
+                                logger.info(f"Node {self.node_id} won election with {votes_received} votes (second phase)")
+                                self.last_successful_election_time = asyncio.get_event_loop().time()
+                                self.consecutive_elections = 0
+                                
+                                # Ακύρωση των υπόλοιπων pending tasks
+                                for t in pending2:
+                                    t.cancel()
+                                    
+                                self.become_leader()
+                                return
+                        except Exception as e:
+                            logger.warning(f"Error processing vote response (second phase): {e}")
+                    
+                    # Ακύρωση τυχόν εναπομεινάντων tasks
+                    for t in pending2:
+                        t.cancel()
+            
             # If we get here, we didn't win the election
             logger.info(f"Node {self.node_id} lost election with {votes_received}/{votes_needed} votes, returning to follower state")
             # Προσθήκα τυχαίας καθυστέρησης μετά από αποτυχημένη εκλογή
@@ -268,10 +322,10 @@ class RaftNode:
                 # Log for debugging
                 logger.debug(f"Leader {self.node_id} sending heartbeats to {len(self.peers)} peers")
                 
-                # Send heartbeats to all peers - χρήση gather για παράλληλη αποστολή
+                # Send heartbeats to all peers - βελτιωμένη χρήση gather για παράλληλη αποστολή
                 heartbeat_tasks = []
                 for peer in self.peers:
-                    # Διόρθωση: Βεβαιωθείτε ότι δεν στέλνουμε heartbeat στον εαυτό μας
+                    # Βεβαιωθείτε ότι δεν στέλνουμε heartbeat στον εαυτό μας
                     if peer != self.node_address:
                         prev_log_index = self.leader_state.next_index[peer] - 1 if self.leader_state else 0
                         prev_log_term = 0
@@ -292,29 +346,51 @@ class RaftNode:
                                 self.volatile_state.commit_index
                             )
                         )
-                        heartbeat_tasks.append(task)
+                        heartbeat_tasks.append((peer, task))
                 
-                # Wait for responses - use gather με return_exceptions για αποφυγή σφαλμάτων
-                if heartbeat_tasks:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
-                    responses = await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
+                # Περιμένουμε απαντήσεις αλλα με προστασία του gather από ακύρωση
+                if heartbeat_tasks:
+                    # Χρήση wait αντί για gather για να αποφύγουμε την ακύρωση όλων των tasks
+                    # όταν ένα αποτύχει
+                    remaining_time = self.config.heartbeat_interval_seconds
                     
-                    # Process responses
-                    for i, response in enumerate(responses):
-                        if isinstance(response, Exception):
-                            logger.warning(f"Error sending heartbeat: {response}")
-                            continue
-                        
-                        # If we got a higher term, revert to follower
-                        if response.get("term", 0) > self.persistent_state.current_term:
-                            logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
-                            self.become_follower(response["term"])
-                            return
-                        
-                        # If successful, check for pending entries to replicate
-                        if i < len(self.peers):  # Πρόσθετος έλεγχος
-                            peer = self.peers[i]
-                            if response.get("success", False) and self.needs_replication(peer):
-                                asyncio.create_task(self.replicate_log(peer))
+                    # Διαιρούμε το χρόνο σε τρία μέρη: αποστολή, επεξεργασία, αναμονή
+                    send_timeout = min(remaining_time * 0.8, 1.0)  # Μέγιστο 1 δευτερόλεπτο
+                    
+                    all_tasks = [task for _, task in heartbeat_tasks]
+                    
+                    # Χρήση wait με timeout
+                    done, pending = await asyncio.wait(
+                        all_tasks,
+                        timeout=send_timeout,
+                        return_when=asyncio.ALL_COMPLETED
+                    )
+                    
+                    # Επεξεργασία των απαντήσεων
+                    for peer, task in heartbeat_tasks:
+                        if task in done:
+                            try:
+                                response = task.result()
+                                
+                                # Αν λάβουμε μεγαλύτερο term, revert to follower
+                                if response.get("term", 0) > self.persistent_state.current_term:
+                                    logger.info(f"Node {self.node_id} discovered higher term during heartbeat")
+                                    self.become_follower(response["term"])
+                                    
+                                    # Ακύρωση τυχόν εκκρεμών εργασιών
+                                    for pending_task in pending:
+                                        pending_task.cancel()
+                                    return
+                                
+                                # Αν επιτύχει, ελέγχουμε για εκκρεμείς καταχωρήσεις προς αντιγραφή
+                                if response.get("success", False) and self.needs_replication(peer):
+                                    asyncio.create_task(self.replicate_log(peer))
+                            except Exception as e:
+                                logger.warning(f"Error processing heartbeat response from {peer}: {e}")
+                    
+                    # Ακύρωση τυχόν εκκρεμών εργασιών
+                    for pending_task in pending:
+                        pending_task.cancel()
                 
                 # Update cluster state for UI
                 self.update_cluster_state()
@@ -365,16 +441,20 @@ class RaftNode:
         entries_dict = [entry.to_dict() for entry in entries_to_send]
         
         try:
-            # Send append entries RPC
-            response = await self.rpc.append_entries(
-                peer,
-                self.persistent_state.current_term,
-                self.node_id,
-                prev_log_index,
-                prev_log_term,
-                entries_dict,
-                self.volatile_state.commit_index
+            # Χρήση asyncio.shield για προστασία από ακύρωση
+            shielded_task = asyncio.shield(
+                self.rpc.append_entries(
+                    peer,
+                    self.persistent_state.current_term,
+                    self.node_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries_dict,
+                    self.volatile_state.commit_index
+                )
             )
+            # Send append entries RPC
+            response = await shielded_task
             
             # Handle response
             if response.get("term", 0) > self.persistent_state.current_term:
@@ -652,20 +732,30 @@ class RaftNode:
                 # Append to log
                 entry = self.log.append(self.persistent_state.current_term, command)
                 
-                # Replicate to followers
+                # Replicate to followers using asyncio.shield για προστασία από ακύρωση
                 replication_tasks = []
                 for peer in self.peers:
-                    # Διόρθωση: Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
+                    # Βεβαιωθείτε ότι δεν προσπαθούμε να αντιγράψουμε το log στον εαυτό μας
                     if peer != self.node_address:
-                        task = asyncio.create_task(self.replicate_log(peer))
+                        task = asyncio.create_task(
+                            asyncio.shield(self.replicate_log(peer))
+                        )
                         replication_tasks.append(task)
                 
-                # Wait for replication with timeout
-                if replication_tasks:  # Βεβαιωθείτε ότι υπάρχουν εργασίες για να εκτελεστούν
-                    await asyncio.wait(replication_tasks, timeout=3.0)  # Αυξήθηκε από 2.0
+                # Wait for replication with timeout αλλά με χρήση wait αντί για wait_for
+                if replication_tasks:
+                    done, pending = await asyncio.wait(
+                        replication_tasks,
+                        timeout=10.0,  # Αυξημένο timeout
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    # Ακύρωση των εκκρεμών tasks μετά το timeout
+                    for task in pending:
+                        task.cancel()
                 
                 # Wait for command to be applied
-                max_wait = 5.0  # seconds
+                max_wait = 10.0  # Αυξημένο από 5.0 seconds
                 wait_start = asyncio.get_event_loop().time()
                 
                 while (
