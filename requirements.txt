@@ -5,3 +5,4 @@ pydantic==2.4.2
 pytest==7.4.3
 pytest-asyncio==0.21.1
 websockets==11.0.3
+aiodns==3.0.0
