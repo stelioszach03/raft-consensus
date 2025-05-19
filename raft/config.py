@@ -19,9 +19,9 @@ class RaftConfig:
     
     # Timing settings (in milliseconds)
     # Βελτιωμένες τιμές για αποφυγή split vote
-    election_timeout_min: int = 1500   # Αυξημένο για προστασία από split votes
-    election_timeout_max: int = 3000   # Μεγαλύτερο εύρος για καλύτερη διαφοροποίηση
-    heartbeat_interval: int = 300      # Αυξημένο για σταθερότερα heartbeats
+    election_timeout_min: int = 500   # Μειωμένο από 1500
+    election_timeout_max: int = 1000  # Μειωμένο από 3000
+    heartbeat_interval: int = 250     # Ελαφρώς μειωμένο από 300
     
     # Storage settings
     storage_dir: str = "data"
@@ -31,29 +31,26 @@ class RaftConfig:
     
     @property
     def random_election_timeout(self) -> float:
-        """Generate a random election timeout in the configured range.
-        
-        Returns a node-specific timeout to prevent simultaneous elections.
-        """
-        # Χρήση του node_id για σταθερή διαφοροποίηση μεταξύ κόμβων
+        """Generate a random election timeout in the configured range."""
+        # Χρήση του node_id για σταθερή διαφοροποίηση
         node_num = int(self.node_id.replace('node', '')) if self.node_id.startswith('node') else 0
         
-        # Διαφοροποίηση βάσει node_id - κάθε κόμβος έχει διαφορετικό εύρος
-        node_offset = node_num * 500  # Αρκετά μεγάλο offset (500ms) μεταξύ κόμβων
+        # Μικρότερη διαφοροποίηση μεταξύ των κόμβων
+        node_offset = node_num * 200  # Μειωμένο από 500ms
         
-        # Τυχαία τιμή μέσα στο εύρος, με προσθήκη του offset
+        # Τυχαία τιμή μέσα στο εύρος
         base_timeout = self.election_timeout_min 
         max_random = self.election_timeout_max - self.election_timeout_min
         random_component = random.uniform(0, max_random)
         
-        # Εξασφάλιση ότι ο node0 έχει το μικρότερο timeout και άρα πιο πιθανό να γίνει leader
+        # Εξασφάλιση ότι ο node0 έχει το μικρότερο timeout 
         if node_num == 0:
-            random_component = random.uniform(0, max_random * 0.5)  # Μισό εύρος για node0
+            random_component = random.uniform(0, max_random * 0.5)
             
         timeout = (base_timeout + node_offset + random_component) / 1000
         
-        # Βεβαιωνόμαστε ότι οι κόμβοι έχουν επαρκώς διαφορετικά timeouts
-        min_recommended = self.heartbeat_interval_seconds * 10
+        # Εξασφαλίζουμε ότι το timeout είναι αρκετά μεγαλύτερο από το heartbeat
+        min_recommended = self.heartbeat_interval_seconds * 3
         if timeout < min_recommended:
             timeout = min_recommended * (1 + 0.5 * random.random())
             

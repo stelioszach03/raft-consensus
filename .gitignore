@@ -1,55 +1,64 @@
-# Node.js
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-
-# Next.js
-.next/
-out/
-build/
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-dist/
+*.so
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
 *.egg
-.env
-.env.*.local
-.venv/
-venv/
-ENV/
-env/
-pip-log.txt
-pip-delete-this-directory.txt
-pytest_cache/
+.pytest_cache/
 .coverage
 htmlcov/
-.tox/
 
-# Docker
-# (αν έχεις αρχεία/φακέλους που γεννάει το Docker, π.χ. volumes)
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+.venv/
 
-# IDEs / Editors
-.vscode/
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Next.js
+.next/
+out/
+
+# IDEs and editors
 .idea/
-*.sublime-project
-*.sublime-workspace
-*.sw?
+.vscode/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
+
+# Docker
+docker-compose.override.yml
 
 # Logs
 logs/
 *.log
 
-# Mac
-.DS_Store
+# Personal Scripts
+dump_code_explicit.sh
+code_dump.txt
 
-# Misc
-dist/
-coverage/
-*.local
+# Data directories created at runtime
+data/

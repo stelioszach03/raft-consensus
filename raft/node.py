@@ -77,32 +77,15 @@ class RaftNode:
         self.min_election_timeout = config.election_timeout_min / 1000.0
         self.leader_stability_timeout = self.min_election_timeout * 3
         
-        # ΚΡΙΣΙΜΗ ΑΛΛΑΓΗ: Ξεκινάμε όλοι ως followers χωρίς αναγνωρισμένο leader
+        # Εξασφάλιση ότι εκκινούμε ως follower
         self.volatile_state.state = NodeState.FOLLOWER
-        self.volatile_state.leader_id = None  # Ξεκάθαρα κανένας leader
+        self.volatile_state.leader_id = None
         
         # Ενημέρωση cluster state
         self.update_cluster_state()
         
-        # ΑΠΛΟΠΟΙΗΜΕΝΗ ΛΟΓΙΚΗ: Ο node0 καθυστερεί ΠΟΛΥ λιγότερο από τους άλλους στην εκκίνηση εκλογής
-        if self.node_id == "node0":
-            election_delay = 0.5  # Μικρή καθυστέρηση για τον node0
-        else:
-            # Οι άλλοι κόμβοι περιμένουν πολύ περισσότερο
-            node_num = int(self.node_id[-1])
-            election_delay = 5.0 + (node_num * 2.0)  # Πολύ μεγαλύτερη διαφορά
-    
-        logger.info(f"Node {self.node_id} will start election after {election_delay}s")
-        self.reset_election_timer_with_delay(election_delay)
-    
-    def reset_election_timer_with_delay(self, delay: float) -> None:
-        """Reset the election timeout timer with a specific delay."""
-        if self.election_timer:
-            self.election_timer.cancel()
-        
-        logger.info(f"Node {self.node_id} setting delayed election timeout: {delay:.2f}s")
-        
-        self.election_timer = asyncio.create_task(self.election_timeout(delay))
+        # Χρήση του κανονικού reset_election_timer
+        self.reset_election_timer()
     
     async def start(self) -> None:
         """Start the Raft node."""
@@ -147,10 +130,7 @@ class RaftNode:
             self.election_timer.cancel()
         
         # Εξασφάλιση μοναδικού timeout βασισμένου στο node_id
-        node_num = int(self.node_id[-1])
-        base_timeout = self.config.election_timeout_min / 1000.0
-        # Αύξηση διαφοράς μεταξύ των timeouts
-        timeout = base_timeout + (node_num * 0.5) + random.uniform(0.1, 0.3)
+        timeout = self.config.random_election_timeout
         
         logger.info(f"Node {self.node_id} setting election timeout: {timeout:.2f}s")
         
@@ -701,9 +681,7 @@ class RaftNode:
         # Update state
         self.volatile_state.state = NodeState.CANDIDATE
         
-        # ΔΙΟΡΘΩΣΗ: Αφαιρέθηκε ο επαναπροσδιορισμός του election timer
-        # ΔΕΝ κάνουμε reset του timer εδώ, για να μην διακόπτεται η εκλογή
-        # self.reset_election_timer()
+        # ΔΙΟΡΘΩΣΗ: ΔΕΝ κάνουμε reset του timer εδώ, για να μην διακόπτεται η εκλογή
         
         # Update cluster state for UI
         self.update_cluster_state()
